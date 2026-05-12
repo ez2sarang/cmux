@@ -1,0 +1,31 @@
+// Claude Code 탭 레이아웃 — new-tab 전용
+// zellij action new-tab -l "claude-tab" 용도
+//
+// new-tab -l 은 세션 default_tab_template 을 적용하지 않으므로
+// tab-bar, cmux-bar, status-bar를 직접 포함합니다
+
+layout {
+    pane size=1 borderless=true {
+        plugin location="zellij:tab-bar"
+    }
+    pane size=1 borderless=true {
+        command "/bin/zsh"
+        args "-c" "while true; do CMUX_BAR_BIN; sleep 1; done"
+    }
+    pane split_direction="vertical" {
+        pane size="65%" focus=true name="claude" {
+            command "CLAUDE_BIN"
+            args "--dangerously-skip-permissions"
+        }
+        pane size="35%" split_direction="horizontal" {
+            pane size="55%" name="files" {
+                command "/bin/zsh"
+                args "-c" "eza --tree --level 2 --icons --color=always . 2>/dev/null || ls -la .; exec zsh -i"
+            }
+            pane size="45%" name="terminal"
+        }
+    }
+    pane size=2 borderless=true {
+        plugin location="zellij:status-bar"
+    }
+}

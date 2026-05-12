@@ -1,0 +1,388 @@
+#!/usr/bin/env zsh
+# cmux — Claude Code 멀티 프로젝트 워크스페이스
+#
+# 사용법:
+#   cmux                 프로젝트 선택 (Space: 다중선택, Enter: 열기)
+#   cmux add [경로]      추가 경로 등록 (DEV_ROOT 외 경로용)
+#   cmux rm              등록 경로 제거
+#   cmux list            프로젝트 목록
+#   cmux -l              zellij 세션 목록
+#   cmux -k              세션 종료
+#   cmux -h              도움말
+
+SESSION_NAME="claude"
+DEV_ROOT="${CMUX_ROOT:-${HOME}/Documents/dev/ai}"
+EXTRAS_FILE="${HOME}/.config/cmux/projects"
+
+# claude 바이너리 탐색: CMUX_CLAUDE_BIN 환경변수 → brew → which
+if [[ -n "$CMUX_CLAUDE_BIN" ]]; then
+  CLAUDE_BIN="$CMUX_CLAUDE_BIN"
+elif [[ -x "/opt/homebrew/bin/claude" ]]; then
+  CLAUDE_BIN="/opt/homebrew/bin/claude"
+elif [[ -x "/usr/local/bin/claude" ]]; then
+  CLAUDE_BIN="/usr/local/bin/claude"
+else
+  CLAUDE_BIN="$(command -v claude 2>/dev/null || echo "claude")"
+fi
+
+# cmux-picker 바이너리 경로 (설치 위치 자동 탐색)
+CMUX_PICKER_BIN="${CMUX_PICKER_BIN:-$(dirname "$0")/cmux-picker}"
+[[ ! -x "$CMUX_PICKER_BIN" ]] && CMUX_PICKER_BIN="$(command -v cmux-picker 2>/dev/null || echo "")"
+
+# cmux-bar 바이너리 경로
+CMUX_BAR_BIN="${CMUX_BAR_BIN:-$(dirname "$0")/cmux-bar}"
+[[ ! -x "$CMUX_BAR_BIN" ]] && CMUX_BAR_BIN="$(command -v cmux-bar 2>/dev/null || echo "")"
+
+# zellij 레이아웃 디렉토리
+ZELLIJ_LAYOUTS_DIR="${CMUX_LAYOUTS_DIR:-${HOME}/.config/zellij/layouts}"
+
+# ── 색상 ──────────────────────────────────────────────
+_c_cyan="\033[36m"
+_c_green="\033[32m"
+_c_yellow="\033[33m"
+_c_gray="\033[90m"
+_c_reset="\033[0m"
+
+_info()  { echo "${_c_cyan}▶${_c_reset} $*" }
+_ok()    { echo "${_c_green}✓${_c_reset} $*" }
+_warn()  { echo "${_c_yellow}!${_c_reset} $*" }
+
+# ── 유틸 ──────────────────────────────────────────────
+_ensure_extras_file() {
+  mkdir -p "$(dirname "$EXTRAS_FILE")"
+  touch "$EXTRAS_FILE"
+}
+
+_clear_session_cache() {
+  local cache="${HOME}/Library/Caches/org.Zellij-Contributors.Zellij/contract_version_1/session_info/${SESSION_NAME}"
+  rm -rf "$cache" 2>/dev/null || true
+}
+
+# DEV_ROOT 하위 폴더 + EXTRAS_FILE 합쳐서 후보 목록 생성
+_project_list() {
+  if [[ -d "$DEV_ROOT" ]]; then
+    for d in "$DEV_ROOT"/*/; do
+      [[ -d "$d" ]] && echo "${d%/}"
+    done
+  fi
+
+  if [[ -f "$EXTRAS_FILE" ]]; then
+    while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      [[ "$p" == "$DEV_ROOT/"* ]] && continue
+      echo "$p"
+    done < "$EXTRAS_FILE"
+  fi
+}
+
+# ── KDL 탭 블록 생성 ──────────────────────────────────
+_kdl_tab() {
+  local dir="$1"
+  local name="$2"
+  local focus="${3:-false}"
+
+  local focus_attr=""
+  [[ "$focus" == "true" ]] && focus_attr=" focus=true"
+
+  local escaped_dir="${dir//\\/\\\\}"
+  escaped_dir="${escaped_dir//\"/\\\"}"
+  local escaped_name="${name//\"/\\\"}"
+
+  local bar_line=""
+  if [[ -n "$CMUX_BAR_BIN" && -x "$CMUX_BAR_BIN" ]]; then
+    bar_line="        pane size=1 borderless=true {
+            command \"/bin/zsh\"
+            args \"-c\" \"while true; do ${CMUX_BAR_BIN}; sleep 1; done\"
+        }"
+  fi
+
+  cat <<KDL
+    tab name="$escaped_name" cwd="$escaped_dir"$focus_attr {
+        pane split_direction="vertical" {
+            pane size="65%" focus=true name="claude" {
+                command "$CLAUDE_BIN"
+                args "--dangerously-skip-permissions"
+            }
+            pane size="35%" split_direction="horizontal" {
+                pane size="55%" name="files" {
+                    command "/bin/zsh"
+                    args "-c" "eza --tree --level 2 --icons --color=always . 2>/dev/null || ls -la .; exec zsh -i"
+                }
+                pane size="45%" name="terminal"
+            }
+        }
+    }
+KDL
+}
+
+# 세션 레이아웃 파일 생성
+_make_layout() {
+  local tmpfile="${ZELLIJ_LAYOUTS_DIR}/cmux-session.kdl"
+  mkdir -p "$ZELLIJ_LAYOUTS_DIR"
+
+  local bar_block=""
+  if [[ -n "$CMUX_BAR_BIN" && -x "$CMUX_BAR_BIN" ]]; then
+    bar_block="        pane size=1 borderless=true {
+            command \"/bin/zsh\"
+            args \"-c\" \"while true; do ${CMUX_BAR_BIN}; sleep 1; done\"
+        }"
+  fi
+
+  cat > "$tmpfile" <<HEADER
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+${bar_block}
+        children
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+HEADER
+
+  local is_first=1
+  for dir in "$@"; do
+    local name
+    name="$(basename "$dir")"
+    if [[ $is_first -eq 1 ]]; then
+      _kdl_tab "$dir" "$name" "true" >> "$tmpfile"
+      is_first=0
+    else
+      _kdl_tab "$dir" "$name" "false" >> "$tmpfile"
+    fi
+  done
+  echo "}" >> "$tmpfile"
+}
+
+# ── 프로젝트 열기 (단일) ──────────────────────────────
+_open_one() {
+  local dir="$1"
+  local name="${2:-$(basename "$dir")}"
+
+  if [[ ! -d "$dir" ]]; then
+    _warn "디렉토리가 없습니다: $dir" >&2
+    return 1
+  fi
+
+  _info "프로젝트 열기: $name"
+
+  if [[ -n "$ZELLIJ" ]]; then
+    zellij action new-tab \
+      -l "claude-tab" \
+      --layout-dir "$ZELLIJ_LAYOUTS_DIR" \
+      -n "$name" \
+      -c "$dir"
+    sleep 0.5
+    zellij action go-to-tab-name "$name"
+    sleep 0.3
+  else
+    zellij delete-session "$SESSION_NAME" --force 2>/dev/null \
+      || zellij kill-session "$SESSION_NAME" 2>/dev/null \
+      || true
+    _clear_session_cache
+    cd "$dir"
+    _make_layout "$dir"
+    exec zellij -s "$SESSION_NAME" -n "cmux-session"
+  fi
+}
+
+# ── 프로젝트 열기 (다중) ─────────────────────────────
+_open_many() {
+  local -a dirs=("$@")
+
+  if [[ -n "$ZELLIJ" ]]; then
+    local first_name=""
+    for dir in "${dirs[@]}"; do
+      local name
+      name="$(basename "$dir")"
+      _info "탭 추가: $name"
+      zellij action new-tab \
+        -l "claude-tab" \
+        --layout-dir "$ZELLIJ_LAYOUTS_DIR" \
+        -n "$name" \
+        -c "$dir"
+      [[ -z "$first_name" ]] && first_name="$name"
+    done
+    sleep 0.5
+    [[ -n "$first_name" ]] && zellij action go-to-tab-name "$first_name"
+    sleep 0.3
+  else
+    _info "프로젝트 ${#dirs[@]}개 탭 생성 중..."
+    zellij delete-session "$SESSION_NAME" --force 2>/dev/null \
+      || zellij kill-session "$SESSION_NAME" 2>/dev/null \
+      || true
+    _clear_session_cache
+    _make_layout "${dirs[@]}"
+    exec zellij -s "$SESSION_NAME" -n "cmux-session"
+  fi
+}
+
+# ── 프로젝트 피커 ──────────────────────────────────────
+_pick() {
+  if [[ -n "$CMUX_PICKER_BIN" && -x "$CMUX_PICKER_BIN" ]]; then
+    CMUX_ROOT="$DEV_ROOT" "$CMUX_PICKER_BIN"
+  else
+    _project_list \
+      | awk -F'/' '{print $NF "\t" $0}' \
+      | sort -f \
+      | fzf --multi --with-nth=1 --delimiter='\t' --prompt=" 프로젝트 > " \
+            --height=80% --layout=reverse --border=rounded \
+      | cut -f2
+  fi
+}
+
+# ── 서브커맨드 ────────────────────────────────────────
+case "$1" in
+  -h|--help)
+    echo "사용법: cmux [서브커맨드] [인수]"
+    echo ""
+    echo "  cmux               프로젝트 선택 (Space: 다중, Enter: 열기)"
+    echo "  cmux add [경로]    DEV_ROOT 외 경로 등록"
+    echo "  cmux rm            등록 경로 제거"
+    echo "  cmux list          전체 프로젝트 목록"
+    echo "  cmux -l            zellij 세션 목록"
+    echo "  cmux -k            세션 종료"
+    echo ""
+    echo "DEV_ROOT: $DEV_ROOT  (환경변수 CMUX_ROOT 로 변경)"
+    echo "Claude:   $CLAUDE_BIN  (환경변수 CMUX_CLAUDE_BIN 로 변경)"
+    exit 0
+    ;;
+
+  add)
+    _ensure_extras_file
+    local target="${2:-$PWD}"
+    local abs_target
+    abs_target=$(realpath "$target" 2>/dev/null || echo "$target")
+
+    if [[ ! -d "$abs_target" ]]; then
+      _warn "디렉토리가 없습니다: $abs_target" >&2
+      exit 1
+    fi
+
+    if [[ "$abs_target" == "$DEV_ROOT/"* ]]; then
+      _warn "DEV_ROOT($DEV_ROOT) 하위는 자동 감지됩니다 — 등록 불필요"
+      exit 0
+    fi
+
+    if grep -qxF "$abs_target" "$EXTRAS_FILE" 2>/dev/null; then
+      _warn "이미 등록됨: $abs_target"
+    else
+      echo "$abs_target" >> "$EXTRAS_FILE"
+      _ok "등록됨: $abs_target"
+    fi
+    exit 0
+    ;;
+
+  rm|remove)
+    _ensure_extras_file
+    if [[ ! -s "$EXTRAS_FILE" ]]; then
+      _warn "추가 등록된 프로젝트가 없습니다."
+      exit 0
+    fi
+
+    local to_remove
+    to_remove=$(cat "$EXTRAS_FILE" | fzf \
+      --prompt="제거할 경로 선택 > " \
+      --preview="ls -la {}" \
+      --preview-window=right:50%:wrap \
+      --height=50%)
+
+    if [[ -n "$to_remove" ]]; then
+      local tmpfile
+      tmpfile=$(mktemp)
+      grep -vxF "$to_remove" "$EXTRAS_FILE" > "$tmpfile" && mv "$tmpfile" "$EXTRAS_FILE"
+      _ok "제거됨: $to_remove"
+    else
+      _info "취소됨"
+    fi
+    exit 0
+    ;;
+
+  list)
+    echo "DEV_ROOT: ${_c_cyan}$DEV_ROOT${_c_reset}"
+    echo ""
+    _project_list | while IFS= read -r p; do
+      local marker="${_c_green}●${_c_reset}"
+      local tag=""
+      [[ ! -d "$p" ]] && marker="${_c_yellow}✗${_c_reset}" && tag=" ${_c_yellow}(없음)${_c_reset}"
+      [[ -d "$p/.git" ]] && tag="${_c_gray} (git)${_c_reset}"
+      echo "  $marker $(basename "$p")${tag}"
+    done
+    exit 0
+    ;;
+
+  -l|--list-sessions)
+    echo "=== Zellij 세션 목록 ==="
+    zellij list-sessions 2>/dev/null || echo "(실행 중인 세션 없음)"
+    exit 0
+    ;;
+
+  -k|--kill)
+    if zellij delete-session "$SESSION_NAME" --force 2>/dev/null \
+       || zellij kill-session "$SESSION_NAME" 2>/dev/null; then
+      _ok "세션 종료: $SESSION_NAME"
+    else
+      _warn "세션이 없거나 이미 종료됨"
+    fi
+    exit 0
+    ;;
+
+  "")
+    # 실행 중인 세션이 있으면 picker 없이 바로 attach
+    if [[ -z "$ZELLIJ" ]]; then
+      local session_status
+      session_status=$(zellij list-sessions --no-formatting 2>/dev/null | grep "^${SESSION_NAME}" | head -1)
+      if [[ -n "$session_status" ]]; then
+        if echo "$session_status" | grep -q "EXITED"; then
+          zellij delete-session "$SESSION_NAME" --force 2>/dev/null || true
+          _clear_session_cache
+        else
+          _info "기존 세션에 연결 중: $SESSION_NAME"
+          exec zellij attach "$SESSION_NAME"
+        fi
+      fi
+    fi
+
+    local -a selected
+    selected=("${(@f)$(_pick)}")
+
+    if [[ ${#selected[@]} -eq 0 ]]; then
+      _info "취소됨"
+      exit 0
+    fi
+
+    local -a valid=()
+    for d in "${selected[@]}"; do
+      if [[ -d "$d" ]]; then
+        valid+=("$d")
+      else
+        _warn "경로 없음 (건너뜀): $d"
+      fi
+    done
+
+    if [[ ${#valid[@]} -eq 0 ]]; then
+      _warn "선택된 유효 경로가 없습니다."
+      exit 1
+    elif [[ ${#valid[@]} -eq 1 ]]; then
+      _open_one "${valid[1]}"
+    else
+      _open_many "${valid[@]}"
+    fi
+    ;;
+
+  *)
+    # cmux PATH — 직접 경로로 열기
+    local target
+    target=$(realpath "$1" 2>/dev/null || echo "$1")
+    local name="${2:-$(basename "$target")}"
+
+    if [[ ! -d "$target" ]]; then
+      _warn "디렉토리가 없습니다: $target" >&2
+      exit 1
+    fi
+
+    _open_one "$target" "$name"
+    ;;
+esac

@@ -1,0 +1,33 @@
+// Zellij config — cmux workspace
+// Docs: https://zellij.dev/documentation/
+
+mouse_mode true
+scroll_buffer_size 10000
+copy_on_select false
+
+// theme_dir "~/.config/zellij/themes"
+// theme "catppuccin-mocha"
+
+default_layout "claude-project"
+
+// cmux가 세션 관리를 담당하므로 비활성화
+session_serialization false
+
+show_startup_tips false
+
+// Ghostty + macos-option-as-alt 와의 충돌 방지
+// Alt+문자/숫자는 이 조합에서 동작하지 않음 (Alt+화살표는 동작)
+use_kitty_keyboard_protocol false
+
+keybinds clear-defaults=false {
+    locked {
+        bind "Ctrl g" { SwitchToMode "Normal"; }
+    }
+
+    shared_except "locked" {
+        // 세션 detach — 세션 유지하고 터미널로 나가기
+        // 재접속: cmux 실행 (세션 있으면 자동 attach)
+        // Ctrl+b (영문) / Ctrl+ㅠ (한글 입력 상태)
+        bind "Ctrl b" "Ctrl ㅠ" { Detach; }
+    }
+}

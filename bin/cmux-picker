@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""
+cmux-picker — 수평 탭 스타일 프로젝트 피커
+curses로 /dev/tty 직접 제어 → command substitution 안에서도 동작
+선택된 프로젝트 경로를 stdout(원본 파이프)으로 출력
+"""
+
+import curses
+import os
+import sys
+
+DEV_ROOT = os.environ.get("CMUX_ROOT", os.path.expanduser("~/Documents/dev/ai"))
+EXTRAS_FILE = os.path.expanduser("~/.config/cmux/projects")
+
+
+def get_projects():
+    projects = []
+
+    if os.path.isdir(DEV_ROOT):
+        try:
+            entries = sorted(os.listdir(DEV_ROOT), key=lambda n: n.lower())
+            for name in entries:
+                if name.startswith("."):
+                    continue
+                full = os.path.join(DEV_ROOT, name)
+                if os.path.isdir(full):
+                    projects.append(full)
+        except PermissionError:
+            pass
+
+    if os.path.isfile(EXTRAS_FILE):
+        prefix = DEV_ROOT.rstrip("/") + "/"
+        with open(EXTRAS_FILE) as f:
+            for line in f:
+                p = line.strip()
+                if p and not p.startswith(prefix) and os.path.isdir(p) and p not in projects:
+                    projects.append(p)
+
+    return projects
+
+
+def compute_all_positions(names, w):
+    """모든 항목의 논리적 (logical_row, col, idx, tab_w) 위치 계산."""
+    positions = []
+    row, col = 0, 2
+
+    for i, name in enumerate(names):
+        label = f" {name} "
+        tab_w = len(label) + 2
+
+        if col + tab_w > w - 2:
+            row += 1
+            col = 2
+
+        positions.append((row, col, i, tab_w))
+        col += tab_w + 1
+
+    return positions
+
+
+def draw(stdscr, names, cursor, selected, scroll_offset, all_positions):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+
+    C_TITLE    = curses.color_pair(1)
+    C_CURSOR   = curses.color_pair(2)
+    C_SELECTED = curses.color_pair(3)
+    C_NORMAL   = curses.color_pair(4)
+    C_DIM      = curses.color_pair(5)
+    C_ACCENT   = curses.color_pair(6)
+
+    # ── 타이틀 ────────────────────────────────────────
+    title = f" cmux — 프로젝트 선택 ({len(names)}개) "
+    try:
+        stdscr.addstr(0, max(0, (w - len(title)) // 2), title, C_TITLE | curses.A_BOLD)
+    except curses.error:
+        pass
+
+    # ── 가시 영역: screen row 2 ~ h-4 ────────────────
+    visible_height = h - 5
+
+    if visible_height < 1:
+        return scroll_offset
+
+    # ── 스크롤 오프셋 자동 조정 ──────────────────────
+    max_logical_row = max(p[0] for p in all_positions) if all_positions else 0
+    cursor_pos = next((p for p in all_positions if p[2] == cursor), None)
+    if cursor_pos:
+        clr = cursor_pos[0]
+        if clr < scroll_offset:
+            scroll_offset = clr
+        elif clr >= scroll_offset + visible_height:
+            scroll_offset = clr - visible_height + 1
+    max_scroll = max(0, max_logical_row - visible_height + 1)
+    scroll_offset = max(0, min(scroll_offset, max_scroll))
+
+    # ── 스크롤 표시 ───────────────────────────────────
+    if scroll_offset > 0:
+        try:
+            stdscr.addstr(1, w - 7, " ↑more ", C_DIM)
+        except curses.error:
+            pass
+    if max_logical_row >= scroll_offset + visible_height:
+        try:
+            stdscr.addstr(h - 3, w - 7, " ↓more ", C_DIM)
+        except curses.error:
+            pass
+
+    # ── 항목 렌더링 ───────────────────────────────────
+    for logical_row, col, i, tab_w in all_positions:
+        screen_row = logical_row - scroll_offset + 2
+        if screen_row < 2 or screen_row > h - 4:
+            continue
+
+        label = f" {names[i]} "
+        try:
+            if i == cursor:
+                stdscr.addstr(screen_row, col,     "▶",    C_ACCENT)
+                stdscr.addstr(screen_row, col + 1, label,  C_CURSOR | curses.A_BOLD)
+                stdscr.addstr(screen_row, col + 1 + len(label), "◀", C_ACCENT)
+            elif i in selected:
+                stdscr.addstr(screen_row, col,     "●",    C_SELECTED | curses.A_BOLD)
+                stdscr.addstr(screen_row, col + 1, label,  C_SELECTED | curses.A_BOLD)
+                stdscr.addstr(screen_row, col + 1 + len(label), "●", C_SELECTED | curses.A_BOLD)
+            else:
+                stdscr.addstr(screen_row, col,     " ",    C_NORMAL)
+                stdscr.addstr(screen_row, col + 1, label,  C_NORMAL)
+                stdscr.addstr(screen_row, col + 1 + len(label), " ", C_NORMAL)
+        except curses.error:
+            pass
+
+    # ── 구분선 + 키 설명 ──────────────────────────────
+    sel_str = f" ● {len(selected)}개 선택" if selected else ""
+    keys_left = " ←→↑↓/hjkl:이동   Space:선택   Enter:열기   Esc:취소"
+    try:
+        stdscr.addstr(h - 2, 0, "─" * w, C_DIM)
+        stdscr.addstr(h - 1, 0, keys_left, C_DIM)
+        if sel_str:
+            stdscr.addstr(h - 1, max(0, w - len(sel_str) - 1), sel_str,
+                          C_SELECTED | curses.A_BOLD)
+    except curses.error:
+        pass
+
+    stdscr.refresh()
+    return scroll_offset
+
+
+def picker_ui(stdscr, projects):
+    names = [os.path.basename(p) for p in projects]
+
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+
+    curses.init_pair(1, curses.COLOR_CYAN,   -1)
+    curses.init_pair(2, curses.COLOR_BLACK,  curses.COLOR_CYAN)
+    curses.init_pair(3, curses.COLOR_GREEN,  -1)
+    curses.init_pair(4, curses.COLOR_WHITE,  -1)
+    curses.init_pair(5, 8,                   -1)
+    curses.init_pair(6, curses.COLOR_YELLOW, -1)
+
+    cursor = 0
+    selected = set()
+    scroll_offset = 0
+
+    while True:
+        h, w = stdscr.getmaxyx()
+        all_positions = compute_all_positions(names, w)
+
+        scroll_offset = draw(stdscr, names, cursor, selected, scroll_offset, all_positions)
+
+        k = stdscr.getch()
+
+        if k in (27, ord("q"), 3):  # Esc, q, Ctrl+C
+            return []
+
+        elif k in (10, 13):  # Enter
+            if selected:
+                return [projects[i] for i in sorted(selected)]
+            return [projects[cursor]]
+
+        elif k == ord(" "):  # Space — 토글 후 다음으로
+            if cursor in selected:
+                selected.discard(cursor)
+            else:
+                selected.add(cursor)
+            cursor = (cursor + 1) % len(names)
+
+        elif k in (curses.KEY_LEFT, ord("h")):
+            cursor = (cursor - 1) % len(names)
+
+        elif k in (curses.KEY_RIGHT, ord("l")):
+            cursor = (cursor + 1) % len(names)
+
+        elif k in (curses.KEY_UP, ord("k")):
+            curr = next((p for p in all_positions if p[2] == cursor), None)
+            if curr:
+                above = [p for p in all_positions if p[0] == curr[0] - 1]
+                if above:
+                    cursor = min(above, key=lambda p: abs(p[1] - curr[1]))[2]
+
+        elif k in (curses.KEY_DOWN, ord("j")):
+            curr = next((p for p in all_positions if p[2] == cursor), None)
+            if curr:
+                below = [p for p in all_positions if p[0] == curr[0] + 1]
+                if below:
+                    cursor = min(below, key=lambda p: abs(p[1] - curr[1]))[2]
+
+    return []
+
+
+def main():
+    projects = get_projects()
+    if not projects:
+        sys.exit(1)
+
+    old_stdin  = os.dup(0)
+    old_stdout = os.dup(1)
+
+    tty = open("/dev/tty", "r+b", buffering=0)
+    os.dup2(tty.fileno(), 0)
+    os.dup2(tty.fileno(), 1)
+
+    try:
+        results = curses.wrapper(picker_ui, projects)
+    finally:
+        os.dup2(old_stdin,  0)
+        os.dup2(old_stdout, 1)
+        os.close(old_stdin)
+        os.close(old_stdout)
+        tty.close()
+
+    for path in results:
+        sys.stdout.write(path + "\n")
+    sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
