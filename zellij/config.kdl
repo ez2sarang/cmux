@@ -3,7 +3,7 @@
 
 mouse_mode true
 scroll_buffer_size 10000
-copy_on_select false
+copy_on_select true
 
 // theme_dir "~/.config/zellij/themes"
 // theme "catppuccin-mocha"
@@ -29,5 +29,9 @@ keybinds clear-defaults=false {
         // 재접속: cmux 실행 (세션 있으면 자동 attach)
         // Ctrl+b (영문) / Ctrl+ㅠ (한글 입력 상태)
         bind "Ctrl b" "Ctrl ㅠ" { Detach; }
+
+        // 탭 순서 변경 — 현재 탭을 좌/우로 한 칸 이동
+        bind "Ctrl Shift Left"  { MoveTab "Left"; }
+        bind "Ctrl Shift Right" { MoveTab "Right"; }
     }
 }
