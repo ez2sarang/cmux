@@ -33,5 +33,11 @@ keybinds clear-defaults=false {
         // 탭 순서 변경 — 현재 탭을 좌/우로 한 칸 이동
         bind "Ctrl Shift Left"  { MoveTab "Left"; }
         bind "Ctrl Shift Right" { MoveTab "Right"; }
+
+        // Ctrl+O를 Claude Code로 패스스루 (app:toggleTranscript)
+        // zellij 기본값: Ctrl+O → Session 모드 (Claude Code에 전달 안 됨)
+        // Session 모드는 Ctrl+Shift+O로 이전
+        unbind "Ctrl o"
+        bind "Ctrl Shift O" { SwitchToMode "Session"; }
     }
 }

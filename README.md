@@ -99,7 +99,20 @@ cmux -k              # 세션 종료
 | 키 | 동작 |
 |----|------|
 | `Ctrl+b` / `Ctrl+ㅠ` | 세션 유지하고 detach |
+| `Ctrl+Shift+Left/Right` | 탭 순서 좌/우로 이동 |
+| `Ctrl+Shift+O` | zellij Session 모드 |
 
+**Claude Code 단축키** (zellij 충돌 해소 후 사용 가능):
+
+| 키 | 동작 |
+|----|------|
+| `Ctrl+O` | 트랜스크립트 보기 토글 (app:toggleTranscript) |
+| `Ctrl+T` | 할 일 목록 토글 — zellij Tab 모드와 충돌 주의 |
+| `Ctrl+G` | 외부 에디터 열기 |
+| `Ctrl+R` | 이전 명령 검색 |
+
+> **zellij 충돌 노트**: `Ctrl+O`는 zellij 기본값(Session 모드)을 `unbind` 처리하여 Claude Code로 패스스루됩니다. zellij Session 모드는 `Ctrl+Shift+O`로 사용하세요.
+>
 > 세션이 살아있으면 다음에 `cmux` 실행 시 picker 없이 바로 재연결됩니다.
 
 ## 설정
