@@ -26,7 +26,14 @@ def get_projects():
                 if os.path.isdir(full):
                     projects.append(full)
         except PermissionError:
-            pass
+            # macOS TCC가 ~/Documents 접근을 차단하면 여기로 온다 — 조용히 삼키면
+            # picker가 이유 없이 즉시 종료된 것처럼 보이므로 반드시 알린다
+            print(
+                f"⚠ 접근 불가: {DEV_ROOT} — macOS TCC 차단 추정.\n"
+                "  시스템 설정 → 개인정보 보호 및 보안 → 전체 디스크 접근 권한에\n"
+                "  zellij(또는 사용 중인 터미널 앱)를 추가한 뒤 다시 실행하세요.",
+                file=sys.stderr,
+            )
 
     if os.path.isfile(EXTRAS_FILE):
         prefix = DEV_ROOT.rstrip("/") + "/"
@@ -212,6 +219,7 @@ def picker_ui(stdscr, projects):
 def main():
     projects = get_projects()
     if not projects:
+        print(f"⚠ 표시할 프로젝트가 없습니다 (DEV_ROOT: {DEV_ROOT})", file=sys.stderr)
         sys.exit(1)
 
     old_stdin  = os.dup(0)
