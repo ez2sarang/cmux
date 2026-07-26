@@ -345,8 +345,20 @@ case "$1" in
       fi
     fi
 
+    # picker 출력과 종료 코드를 분리 캡처 — 실패(exit≠0)와 취소(exit 0)를 구분
+    local pick_out pick_status
+    pick_out="$(_pick)"
+    pick_status=$?
+
     local -a selected
-    selected=("${(@f)$(_pick)}")
+    selected=("${(@f)pick_out}")
+    selected=("${(@)selected:#}")  # 빈 요소 제거 (빈 출력 → 빈 배열)
+
+    if [[ $pick_status -ne 0 && ${#selected[@]} -eq 0 ]]; then
+      _warn "프로젝트 선택기 실행 실패 (exit $pick_status) — 위 오류 메시지를 확인하세요."
+      _warn "우회: 'cmux list'로 목록 확인 또는 'cmux <경로>'로 직접 열기"
+      exit 1
+    fi
 
     if [[ ${#selected[@]} -eq 0 ]]; then
       _info "취소됨"
