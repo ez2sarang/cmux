@@ -152,6 +152,38 @@ def draw(stdscr, names, cursor, selected, scroll_offset, all_positions):
     return scroll_offset
 
 
+# 일반 커서 모드 방향키의 마지막 바이트 → curses 키 코드
+_ARROW_KEYS = {
+    ord("A"): curses.KEY_UP,
+    ord("B"): curses.KEY_DOWN,
+    ord("C"): curses.KEY_RIGHT,
+    ord("D"): curses.KEY_LEFT,
+}
+
+
+def read_key(stdscr):
+    """getch 래퍼 — terminfo에 없는 이스케이프 시퀀스를 직접 해석.
+
+    terminfo에는 애플리케이션 모드 방향키(ESC O A~D)만 정의돼 있어, 터미널이
+    일반 커서 모드로 보내는 ESC [ A~D 는 curses가 인식하지 못하고 27(Esc)만
+    돌려준다 → 방향키가 취소로 처리돼 picker가 이유 없이 닫혔다.
+    curses.define_key()는 macOS 시스템 python3의 _curses(ncurses 6.0)에
+    없으므로 Esc 뒤에 남은 바이트를 직접 읽어 매핑한다.
+    """
+    k = stdscr.getch()
+    if k != 27:
+        return k
+
+    stdscr.timeout(25)  # 뒤따르는 바이트만 잠깐 확인 — 없으면 진짜 Esc
+    try:
+        nxt = stdscr.getch()
+        if nxt in (ord("["), ord("O")):
+            return _ARROW_KEYS.get(stdscr.getch(), -1)  # 모르는 시퀀스는 무시
+        return 27  # Esc 단독 / Esc + 다른 키 → 취소
+    finally:
+        stdscr.timeout(-1)
+
+
 def picker_ui(stdscr, projects):
     names = [os.path.basename(p) for p in projects]
 
@@ -176,9 +208,9 @@ def picker_ui(stdscr, projects):
 
         scroll_offset = draw(stdscr, names, cursor, selected, scroll_offset, all_positions)
 
-        k = stdscr.getch()
+        k = read_key(stdscr)
 
-        if k in (27, ord("q"), 3):  # Esc, q, Ctrl+C
+        if k in (27, ord("q")):  # Esc, q (Ctrl+C는 SIGINT로 들어와 main()에서 처리)
             return []
 
         elif k in (10, 13):  # Enter
@@ -217,6 +249,10 @@ def picker_ui(stdscr, projects):
 
 
 def main():
+    # curses 기본 ESCDELAY(1000ms) 때문에 Esc 반응이 1초 늦다. initscr 이전에
+    # 잡아야 적용되므로 wrapper 호출 전에 설정한다 (25ms → 체감 즉시).
+    os.environ.setdefault("ESCDELAY", "25")
+
     projects = get_projects()
     if not projects:
         print(f"⚠ 표시할 프로젝트가 없습니다 (DEV_ROOT: {DEV_ROOT})", file=sys.stderr)
@@ -231,6 +267,11 @@ def main():
 
     try:
         results = curses.wrapper(picker_ui, projects)
+    except KeyboardInterrupt:
+        # cbreak(ISIG 유지) 상태라 Ctrl+C는 getch()에서 KeyboardInterrupt로 터진다.
+        # 트레이스백 + 비정상 종료코드를 내면 호출부(bin/cmux)가 "프로젝트 선택기
+        # 실행 실패"로 오인하므로 Esc와 동일하게 조용히 취소 처리한다.
+        results = []
     finally:
         os.dup2(old_stdin,  0)
         os.dup2(old_stdout, 1)
