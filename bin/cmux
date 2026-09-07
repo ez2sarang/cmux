@@ -2,17 +2,24 @@
 # cmux — Claude Code 멀티 프로젝트 워크스페이스
 #
 # 사용법:
-#   cmux                 프로젝트 선택 (Space: 다중선택, Enter: 열기)
+#   cmux                 세션 연결 / 이전 탭 복원 / 프로젝트 선택
+#   cmux <경로>          경로 직접 열기
+#   cmux pick            기록 무시하고 프로젝트 선택기 실행
 #   cmux add [경로]      추가 경로 등록 (DEV_ROOT 외 경로용)
 #   cmux rm              등록 경로 제거
 #   cmux list            프로젝트 목록
 #   cmux -l              zellij 세션 목록
-#   cmux -k              세션 종료
+#   cmux -k              세션 재시작 (같은 탭 복원 + Claude 대화 이어서)
+#   cmux kill            세션 종료만 (탭 기록 보존)
 #   cmux -h              도움말
 
-SESSION_NAME="claude"
+SESSION_NAME="${CMUX_SESSION:-claude}"
 DEV_ROOT="${CMUX_ROOT:-${HOME}/Documents/dev/ai}"
 EXTRAS_FILE="${HOME}/.config/cmux/projects"
+# 세션에 열려 있던 탭(프로젝트 경로) 기록 — 재시작·크래시 후 복원용
+TABS_FILE="${CMUX_TABS_FILE:-${HOME}/.config/cmux/session-tabs}"
+# 자기 자신의 절대 경로 (zellij pane 명령으로 사용)
+CMUX_SELF="${0:A}"
 
 # claude 바이너리 탐색: CMUX_CLAUDE_BIN 환경변수 → brew → which
 if [[ -n "$CMUX_CLAUDE_BIN" ]]; then
@@ -35,6 +42,7 @@ CMUX_BAR_BIN="${CMUX_BAR_BIN:-$(dirname "$0")/cmux-bar}"
 
 # zellij 레이아웃 디렉토리
 ZELLIJ_LAYOUTS_DIR="${CMUX_LAYOUTS_DIR:-${HOME}/.config/zellij/layouts}"
+SESSION_LAYOUT_FILE="${ZELLIJ_LAYOUTS_DIR}/cmux-session.kdl"
 
 # ── 색상 ──────────────────────────────────────────────
 _c_cyan="\033[36m"
@@ -75,6 +83,133 @@ _project_list() {
   fi
 }
 
+# ── 세션 상태 ─────────────────────────────────────────
+# 살아 있으면 0. EXITED(부활 캐시만 남은 상태)면 정리하고 1.
+_session_alive() {
+  local line
+  line=$(zellij list-sessions --no-formatting 2>/dev/null | grep -E "^${SESSION_NAME}"'( |$)' | head -1)
+  [[ -z "$line" ]] && return 1
+  if [[ "$line" == *EXITED* ]]; then
+    zellij delete-session "$SESSION_NAME" --force 2>/dev/null || true
+    _clear_session_cache
+    return 1
+  fi
+  return 0
+}
+
+# ── 탭 구성 기록 ──────────────────────────────────────
+# 기록된 경로 중 실제로 존재하는 것만 순서대로 출력
+_tabs_load() {
+  [[ -f "$TABS_FILE" ]] || return 0
+  local p
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    [[ -d "$p" ]] || continue
+    echo "$p"
+  done < "$TABS_FILE"
+}
+
+# 기록 전체 덮어쓰기
+_tabs_save() {
+  mkdir -p "$(dirname "$TABS_FILE")"
+  : > "$TABS_FILE"
+  local d
+  for d in "$@"; do
+    [[ -z "$d" ]] && continue
+    echo "$d" >> "$TABS_FILE"
+  done
+}
+
+# 없는 항목만 뒤에 추가 (순서 유지, 중복 제거)
+_tabs_append() {
+  mkdir -p "$(dirname "$TABS_FILE")"
+  touch "$TABS_FILE"
+  local d
+  for d in "$@"; do
+    [[ -z "$d" ]] && continue
+    grep -qxF "$d" "$TABS_FILE" 2>/dev/null || echo "$d" >> "$TABS_FILE"
+  done
+}
+
+# 살아 있는 세션의 실제 탭 순서로 기록 정리 (kill/restart 직전에 호출)
+_tabs_sync_live() {
+  _session_alive || return 0
+
+  local names
+  if [[ -n "$ZELLIJ" ]]; then
+    names=$(zellij action query-tab-names 2>/dev/null)
+  else
+    names=$(zellij -s "$SESSION_NAME" action query-tab-names 2>/dev/null)
+  fi
+  [[ $? -ne 0 || -z "$names" ]] && return 0
+
+  # 후보: 기존 기록(우선) + 프로젝트 목록. 탭 이름(basename)으로 경로를 역추적한다.
+  local -a recorded candidates dirs
+  recorded=("${(@f)$(_tabs_load)}")
+  recorded=("${(@)recorded:#}")
+  candidates=("${recorded[@]}" "${(@f)$(_project_list)}")
+  candidates=("${(@)candidates:#}")
+  dirs=()
+
+  local n c hit unmapped=0
+  while IFS= read -r n; do
+    [[ -z "$n" ]] && continue
+    hit=""
+    for c in "${candidates[@]}"; do
+      [[ "${c:t}" == "$n" ]] || continue
+      # 이미 다른 탭에 배정된 경로는 제외 — 같은 이름의 프로젝트 2개를 구분
+      (( ${dirs[(Ie)$c]} )) && continue
+      hit="$c"
+      break
+    done
+    if [[ -n "$hit" ]]; then
+      dirs+=("$hit")
+    else
+      (( unmapped++ ))
+    fi
+  done <<< "$names"
+
+  if (( unmapped > 0 )); then
+    # 이름을 바꾼 탭 등 경로를 알 수 없는 탭이 있으면 기존 기록을 버리지 않고 병합
+    for c in "${recorded[@]}"; do
+      (( ${dirs[(Ie)$c]} )) || dirs+=("$c")
+    done
+    _warn "경로를 알 수 없는 탭 ${unmapped}개 — 기존 기록과 병합해 보존합니다" >&2
+  fi
+
+  [[ ${#dirs[@]} -gt 0 ]] && _tabs_save "${dirs[@]}"
+  return 0
+}
+
+# ── zellij 클라이언트 실행 + 재시작 감시 ──────────────
+# 'cmux -k'를 세션 안에서 실행하면 이 마커를 남기고 세션을 죽인다.
+# 클라이언트가 종료된 뒤 마커가 있으면 같은 터미널에서 즉시 같은 탭으로 복원한다.
+RESTART_MARKER="${TABS_FILE}.restart"
+
+_run_client() {
+  rm -f "$RESTART_MARKER"
+  zellij "$@"
+  local rc=$?
+
+  if [[ -f "$RESTART_MARKER" ]]; then
+    rm -f "$RESTART_MARKER"
+    _info "세션 재시작 중..."
+    local waited=0
+    while _session_alive && (( waited < 60 )); do
+      sleep 0.1
+      (( waited++ ))
+    done
+    _clear_session_cache
+    if _restore_tabs; then
+      exit 0
+    fi
+    _warn "복원할 탭 기록 없음 — 프로젝트를 선택하세요."
+    _pick_flow
+    exit $?
+  fi
+  exit $rc
+}
+
 # ── KDL 탭 블록 생성 ──────────────────────────────────
 _kdl_tab() {
   local dir="$1"
@@ -87,6 +222,8 @@ _kdl_tab() {
   local escaped_dir="${dir//\\/\\\\}"
   escaped_dir="${escaped_dir//\"/\\\"}"
   local escaped_name="${name//\"/\\\"}"
+  local escaped_self="${CMUX_SELF//\\/\\\\}"
+  escaped_self="${escaped_self//\"/\\\"}"
 
   local bar_line=""
   if [[ -n "$CMUX_BAR_BIN" && -x "$CMUX_BAR_BIN" ]]; then
@@ -101,8 +238,8 @@ _kdl_tab() {
     tab name="$escaped_name" cwd="$escaped_dir"$focus_attr {
         pane split_direction="vertical" {
             pane size="65%" focus=true name="claude" {
-                command "$CLAUDE_BIN"
-                args "--dangerously-skip-permissions"
+                command "$escaped_self"
+                args "launch"
             }
             pane size="35%" split_direction="horizontal" {
                 pane size="55%" name="files" {
@@ -118,7 +255,7 @@ KDL
 
 # 세션 레이아웃 파일 생성
 _make_layout() {
-  local tmpfile="${ZELLIJ_LAYOUTS_DIR}/cmux-session.kdl"
+  local tmpfile="$SESSION_LAYOUT_FILE"
   mkdir -p "$ZELLIJ_LAYOUTS_DIR"
 
   local bar_block=""
@@ -144,18 +281,55 @@ ${bar_block}
     }
 HEADER
 
-  local is_first=1
+  # 포커스 탭: LAYOUT_FOCUS_DIR 이 지정되면 그 탭, 아니면 첫 탭
+  local focus_dir="${LAYOUT_FOCUS_DIR:-$1}"
+  local dir name
   for dir in "$@"; do
-    local name
-    name="$(basename "$dir")"
-    if [[ $is_first -eq 1 ]]; then
+    name="${dir:t}"
+    if [[ "$dir" == "$focus_dir" ]]; then
       _kdl_tab "$dir" "$name" "true" >> "$tmpfile"
-      is_first=0
     else
       _kdl_tab "$dir" "$name" "false" >> "$tmpfile"
     fi
   done
   echo "}" >> "$tmpfile"
+}
+
+# 세션에 클라이언트(터미널)가 붙어 있으면 0
+_client_attached() {
+  zellij -s "$SESSION_NAME" action list-clients 2>/dev/null | tail -n +2 | grep -q .
+}
+
+# 살아 있는 세션에 연결하면서 탭 추가
+# zellij 0.45.1은 클라이언트가 없는 세션에 new-tab -l 을 넣으면 레이아웃 적용에 실패하고
+# ("Not enough room for panes") 다음 attach 때 그 탭을 버린다 — CLI는 성공 코드를 돌려준다.
+# → 먼저 attach하고, 클라이언트가 붙은 것을 확인한 뒤 백그라운드에서 탭을 추가한다.
+_attach_then_add_tabs() {
+  local -a dirs=("$@")
+  (
+    local i=0
+    while (( i < 50 )) && ! _client_attached; do
+      sleep 0.1
+      (( i++ ))
+    done
+    # 클라이언트가 끝내 붙지 않았으면(attach 실패) 탭을 만들지도 기록하지도 않는다
+    _client_attached || exit 0
+    sleep 0.3
+    local first_name="" dir name
+    for dir in "${dirs[@]}"; do
+      name="${dir:t}"
+      zellij -s "$SESSION_NAME" action new-tab \
+        -l "claude-tab" \
+        --layout-dir "$ZELLIJ_LAYOUTS_DIR" \
+        -n "$name" \
+        -c "$dir" \
+      && _tabs_append "$dir" \
+      && [[ -z "$first_name" ]] && first_name="$name"
+    done
+    sleep 0.3
+    [[ -n "$first_name" ]] && zellij -s "$SESSION_NAME" action go-to-tab-name "$first_name"
+  ) </dev/null >/dev/null 2>&1 &
+  _run_client attach "$SESSION_NAME"
 }
 
 # ── 프로젝트 열기 (단일) ──────────────────────────────
@@ -175,18 +349,31 @@ _open_one() {
       -l "claude-tab" \
       --layout-dir "$ZELLIJ_LAYOUTS_DIR" \
       -n "$name" \
-      -c "$dir"
+      -c "$dir" \
+    && _tabs_append "$dir"
     sleep 0.5
     zellij action go-to-tab-name "$name"
     sleep 0.3
+  elif _session_alive; then
+    # 살아 있는 세션은 절대 죽이지 않는다 — 연결한 뒤 탭 추가
+    _attach_then_add_tabs "$dir"
   else
-    zellij delete-session "$SESSION_NAME" --force 2>/dev/null \
-      || zellij kill-session "$SESSION_NAME" 2>/dev/null \
-      || true
-    _clear_session_cache
+    # 세션이 죽은 상태에서 경로를 직접 열면 이전 탭 기록을 버리지 않고 함께 복원
+    # (picker로 고른 새 구성은 CMUX_FRESH=1 이라 기록을 대체)
+    local -a dirs=()
+    if [[ -z "$CMUX_FRESH" ]]; then
+      dirs=("${(@f)$(_tabs_load)}")
+      dirs=("${(@)dirs:#}")
+      dirs=("${(@)dirs:#$dir}")
+    fi
+    if [[ ${#dirs[@]} -gt 0 ]]; then
+      _info "이전 세션 탭 ${#dirs[@]}개도 함께 복원 — 새 구성으로 시작하려면 'cmux pick'"
+    fi
+    dirs+=("$dir")
+    _tabs_save "${dirs[@]}"
     cd "$dir"
-    _make_layout "$dir"
-    exec zellij -s "$SESSION_NAME" -n "cmux-session"
+    LAYOUT_FOCUS_DIR="$dir" _make_layout "${dirs[@]}"
+    _run_client -s "$SESSION_NAME" -n "$SESSION_LAYOUT_FILE"
   fi
 }
 
@@ -195,30 +382,51 @@ _open_many() {
   local -a dirs=("$@")
 
   if [[ -n "$ZELLIJ" ]]; then
-    local first_name=""
+    local first_name="" dir name
     for dir in "${dirs[@]}"; do
-      local name
-      name="$(basename "$dir")"
+      name="${dir:t}"
       _info "탭 추가: $name"
       zellij action new-tab \
         -l "claude-tab" \
         --layout-dir "$ZELLIJ_LAYOUTS_DIR" \
         -n "$name" \
-        -c "$dir"
-      [[ -z "$first_name" ]] && first_name="$name"
+        -c "$dir" \
+      && _tabs_append "$dir" \
+      && [[ -z "$first_name" ]] && first_name="$name"
     done
     sleep 0.5
     [[ -n "$first_name" ]] && zellij action go-to-tab-name "$first_name"
     sleep 0.3
+  elif _session_alive; then
+    # 살아 있는 세션은 절대 죽이지 않는다 — 연결한 뒤 탭 추가
+    local dir
+    for dir in "${dirs[@]}"; do
+      _info "탭 추가: ${dir:t}"
+    done
+    _attach_then_add_tabs "${dirs[@]}"
   else
     _info "프로젝트 ${#dirs[@]}개 탭 생성 중..."
-    zellij delete-session "$SESSION_NAME" --force 2>/dev/null \
-      || zellij kill-session "$SESSION_NAME" 2>/dev/null \
-      || true
-    _clear_session_cache
+    _tabs_save "${dirs[@]}"
     _make_layout "${dirs[@]}"
-    exec zellij -s "$SESSION_NAME" -n "cmux-session"
+    _run_client -s "$SESSION_NAME" -n "$SESSION_LAYOUT_FILE"
   fi
+}
+
+# 기록된 탭 복원 (있으면 0, 없으면 1)
+_restore_tabs() {
+  local -a restore
+  restore=("${(@f)$(_tabs_load)}")
+  restore=("${(@)restore:#}")  # 빈 요소 제거
+
+  [[ ${#restore[@]} -eq 0 ]] && return 1
+
+  _info "이전 세션 복원: ${#restore[@]}개 탭 (Claude 대화 이어서) — 다른 구성을 고르려면 'cmux pick'"
+  if [[ ${#restore[@]} -eq 1 ]]; then
+    _open_one "${restore[1]}"
+  else
+    _open_many "${restore[@]}"
+  fi
+  return 0
 }
 
 # ── 프로젝트 피커 ──────────────────────────────────────
@@ -235,21 +443,95 @@ _pick() {
   fi
 }
 
+# 피커 실행 → 선택 결과로 열기
+_pick_flow() {
+  # picker 출력과 종료 코드를 분리 캡처 — 실패(exit≠0)와 취소(exit 0)를 구분
+  local pick_out pick_status
+  pick_out="$(_pick)"
+  pick_status=$?
+
+  local -a selected
+  selected=("${(@f)pick_out}")
+  selected=("${(@)selected:#}")  # 빈 요소 제거 (빈 출력 → 빈 배열)
+
+  if [[ $pick_status -ne 0 && ${#selected[@]} -eq 0 ]]; then
+    _warn "프로젝트 선택기 실행 실패 (exit $pick_status) — 위 오류 메시지를 확인하세요."
+    _warn "우회: 'cmux list'로 목록 확인 또는 'cmux <경로>'로 직접 열기"
+    exit 1
+  fi
+
+  if [[ ${#selected[@]} -eq 0 ]]; then
+    _info "취소됨"
+    exit 0
+  fi
+
+  local -a valid=()
+  for d in "${selected[@]}"; do
+    if [[ -d "$d" ]]; then
+      valid+=("$d")
+    else
+      _warn "경로 없음 (건너뜀): $d"
+    fi
+  done
+
+  if [[ ${#valid[@]} -eq 0 ]]; then
+    _warn "선택된 유효 경로가 없습니다."
+    exit 1
+  fi
+
+  # picker로 고른 구성은 "새 구성" — 세션이 없을 때 이전 기록을 대체한다
+  CMUX_FRESH=1
+  if [[ ${#valid[@]} -eq 1 ]]; then
+    _open_one "${valid[1]}"
+  else
+    _open_many "${valid[@]}"
+  fi
+}
+
 # ── 서브커맨드 ────────────────────────────────────────
 case "$1" in
   -h|--help)
     echo "사용법: cmux [서브커맨드] [인수]"
     echo ""
-    echo "  cmux               프로젝트 선택 (Space: 다중, Enter: 열기)"
+    echo "  cmux               세션 연결 / 없으면 이전 탭 복원 / 기록 없으면 선택기"
+    echo "  cmux <경로>        경로 직접 열기 (세션이 살아 있으면 탭 추가)"
+    echo "  cmux pick          기록 무시하고 프로젝트 선택기 실행"
     echo "  cmux add [경로]    DEV_ROOT 외 경로 등록"
     echo "  cmux rm            등록 경로 제거"
     echo "  cmux list          전체 프로젝트 목록"
     echo "  cmux -l            zellij 세션 목록"
-    echo "  cmux -k            세션 종료"
+    echo "  cmux -k            세션 재시작 — 같은 탭 복원 + 각 탭 Claude 대화 이어서 (세션 안/밖 모두)"
+    echo "  cmux kill          세션 종료만 (탭 기록은 보존 — 다음 'cmux'가 복원)"
+    echo "  cmux launch [경로] (내부용) Claude Code 실행 — 대화 기록 있으면 --continue"
     echo ""
     echo "DEV_ROOT: $DEV_ROOT  (환경변수 CMUX_ROOT 로 변경)"
     echo "Claude:   $CLAUDE_BIN  (환경변수 CMUX_CLAUDE_BIN 로 변경)"
+    echo "탭 기록:  $TABS_FILE  (환경변수 CMUX_TABS_FILE 로 변경)"
     exit 0
+    ;;
+
+  launch)
+    # zellij claude pane 진입점 — 해당 디렉토리에 이전 대화가 있으면 --continue
+    local ldir="${2:-$PWD}"
+    [[ -d "$ldir" ]] && cd "$ldir"
+
+    local cfg="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
+    local -a launch_args=("--dangerously-skip-permissions")
+    local key_logical="${PWD//[^A-Za-z0-9]/-}"
+    local phys
+    phys="$(pwd -P)"
+    local key_phys="${phys//[^A-Za-z0-9]/-}"
+
+    local k
+    for k in "$key_logical" "$key_phys"; do
+      local -a found=("$cfg/projects/$k"/*.jsonl(N))
+      if [[ ${#found[@]} -gt 0 ]]; then
+        launch_args+=("--continue")
+        break
+      fi
+    done
+
+    exec "$CLAUDE_BIN" "${launch_args[@]}"
     ;;
 
   add)
@@ -321,69 +603,73 @@ case "$1" in
     exit 0
     ;;
 
-  -k|--kill)
+  -k|--restart|restart)
+    # 재시작: 현재 탭 구성 기록 → 종료 → 같은 탭으로 재생성 (Claude 대화 이어서)
+    _tabs_sync_live
+
+    if [[ -n "$ZELLIJ" ]]; then
+      # 세션 안에서는 이 pane도 함께 사라진다 — 마커를 남기면 터미널의 cmux(_run_client)가
+      # 클라이언트 종료 직후 같은 탭으로 재생성한다. (cmux 없이 attach한 경우는 다음 'cmux'가 복원)
+      mkdir -p "$(dirname "$RESTART_MARKER")"
+      touch "$RESTART_MARKER"
+      _info "세션 재시작 — 같은 탭으로 복원됩니다. (자동 복원이 안 되면 셸에서 'cmux')"
+      sleep 0.3
+      zellij delete-session "$SESSION_NAME" --force 2>/dev/null \
+        || zellij kill-session "$SESSION_NAME" 2>/dev/null \
+        || true
+      exit 0
+    fi
+
+    zellij delete-session "$SESSION_NAME" --force 2>/dev/null \
+      || zellij kill-session "$SESSION_NAME" 2>/dev/null \
+      || true
+
+    # 서버가 완전히 사라질 때까지 대기 (최대 ~6초)
+    local waited=0
+    while _session_alive && (( waited < 60 )); do
+      sleep 0.1
+      (( waited++ ))
+    done
+    _clear_session_cache
+
+    if _restore_tabs; then
+      exit 0
+    fi
+    _warn "복원할 탭 기록 없음 — 프로젝트를 선택하세요."
+    _pick_flow
+    ;;
+
+  kill|-K|--kill)
+    # 종료만 — 탭 기록은 남겨서 다음 'cmux'가 복원
+    _tabs_sync_live
     if zellij delete-session "$SESSION_NAME" --force 2>/dev/null \
        || zellij kill-session "$SESSION_NAME" 2>/dev/null; then
-      _ok "세션 종료: $SESSION_NAME"
+      _ok "세션 종료: $SESSION_NAME (탭 기록 보존 — 다음 'cmux'가 복원)"
     else
       _warn "세션이 없거나 이미 종료됨"
     fi
     exit 0
     ;;
 
+  pick|new)
+    # 기록 무시하고 새 구성 선택
+    _pick_flow
+    ;;
+
   "")
-    # 실행 중인 세션이 있으면 picker 없이 바로 attach
     if [[ -z "$ZELLIJ" ]]; then
-      local session_status
-      session_status=$(zellij list-sessions --no-formatting 2>/dev/null | grep "^${SESSION_NAME}" | head -1)
-      if [[ -n "$session_status" ]]; then
-        if echo "$session_status" | grep -q "EXITED"; then
-          zellij delete-session "$SESSION_NAME" --force 2>/dev/null || true
-          _clear_session_cache
-        else
-          _info "기존 세션에 연결 중: $SESSION_NAME"
-          exec zellij attach "$SESSION_NAME"
-        fi
+      # 실행 중인 세션이 있으면 picker 없이 바로 attach
+      if _session_alive; then
+        _info "기존 세션에 연결 중: $SESSION_NAME"
+        _run_client attach "$SESSION_NAME"
+      fi
+      # 세션이 없으면 이전 탭 구성을 그대로 복원
+      if _restore_tabs; then
+        exit 0
       fi
     fi
 
-    # picker 출력과 종료 코드를 분리 캡처 — 실패(exit≠0)와 취소(exit 0)를 구분
-    local pick_out pick_status
-    pick_out="$(_pick)"
-    pick_status=$?
-
-    local -a selected
-    selected=("${(@f)pick_out}")
-    selected=("${(@)selected:#}")  # 빈 요소 제거 (빈 출력 → 빈 배열)
-
-    if [[ $pick_status -ne 0 && ${#selected[@]} -eq 0 ]]; then
-      _warn "프로젝트 선택기 실행 실패 (exit $pick_status) — 위 오류 메시지를 확인하세요."
-      _warn "우회: 'cmux list'로 목록 확인 또는 'cmux <경로>'로 직접 열기"
-      exit 1
-    fi
-
-    if [[ ${#selected[@]} -eq 0 ]]; then
-      _info "취소됨"
-      exit 0
-    fi
-
-    local -a valid=()
-    for d in "${selected[@]}"; do
-      if [[ -d "$d" ]]; then
-        valid+=("$d")
-      else
-        _warn "경로 없음 (건너뜀): $d"
-      fi
-    done
-
-    if [[ ${#valid[@]} -eq 0 ]]; then
-      _warn "선택된 유효 경로가 없습니다."
-      exit 1
-    elif [[ ${#valid[@]} -eq 1 ]]; then
-      _open_one "${valid[1]}"
-    else
-      _open_many "${valid[@]}"
-    fi
+    _pick_flow
     ;;
 
   *)

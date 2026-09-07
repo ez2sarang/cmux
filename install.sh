@@ -110,10 +110,13 @@ _install_layout() {
     return 0
   fi
 
-  # CMUX_BAR_BIN, CLAUDE_BIN 플레이스홀더 치환
+  # CMUX_BAR_BIN → CMUX_BIN → CLAUDE_BIN 순서로 플레이스홀더 치환
+  # (claude pane은 'cmux launch'를 실행 — 이전 대화가 있으면 --continue 로 이어감)
   local cmux_bar_path="${BIN_DIR}/cmux-bar"
+  local cmux_path="${BIN_DIR}/cmux"
   sed \
     -e "s|CMUX_BAR_BIN|${cmux_bar_path}|g" \
+    -e "s|CMUX_BIN|${cmux_path}|g" \
     -e "s|CLAUDE_BIN|${CLAUDE_BIN}|g" \
     "$tmpl" > "$dst"
   _ok "$(basename "${tmpl%.tmpl}") → $dst"

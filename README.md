@@ -18,7 +18,10 @@ tmux, screen 등 여러 터미널 멀티플렉서 중 zellij를 선택한 이유
 `zellij action` 명령으로 세션 밖에서 탭 전환, 이름 지정, 명령 실행 등을 제어할 수 있습니다. cmux의 세션 감지(`zellij list-sessions`)와 자동 reattach가 이 덕분에 가능합니다.
 
 **세션 유지**
-`Ctrl+b`로 세션을 종료하지 않고 detach할 수 있습니다. 다음에 `cmux`를 실행하면 picker 없이 바로 이전 작업 환경으로 돌아옵니다.
+`Ctrl+b`로 세션을 종료하지 않고 detach할 수 있습니다. 다음에 `cmux`를 실행하면 picker 없이 바로 이전 작업 환경으로 돌아옵니다. 터미널 앱(Ghostty 등)을 그냥 닫아도 zellij 서버와 각 탭의 Claude Code는 살아 있으므로 같은 방법으로 돌아옵니다.
+
+**세션이 죽어도 이어가기**
+zellij 서버가 크래시하거나 `cmux -k`로 재시작해도 작업을 이어갈 수 있습니다. cmux는 열려 있는 프로젝트 탭 목록을 `~/.config/cmux/session-tabs`에 기록해 두고, 세션이 없는 상태에서 `cmux`를 실행하면 같은 탭을 같은 순서로 다시 만듭니다. 각 탭의 Claude Code는 `cmux launch`를 통해 시작되며, 그 디렉토리에 이전 대화 기록이 있으면 `claude --continue`로 가장 최근 대화를 재개합니다(기록이 없으면 새로 시작). 단, 같은 디렉토리에서 더 나중에 다른 Claude 세션을 실행했다면 그 세션이 재개됩니다. 기록을 무시하고 새 구성을 고르려면 `cmux pick`을 사용하세요.
 
 **내장 상태 바 + 탭 바**
 별도 설정 없이 탭 목록과 단축키 안내가 표시됩니다. Claude Code 같은 TUI 앱과 함께 쓸 때 화면 구성이 자연스럽습니다.
@@ -75,14 +78,18 @@ export PATH="$HOME/.local/bin:$PATH"
 ## 사용법
 
 ```zsh
-cmux                 # 프로젝트 선택 (Space: 다중선택, Enter: 열기)
-cmux /path/to/proj   # 경로 직접 열기
+cmux                 # 세션 연결 → 없으면 이전 탭 복원 → 기록 없으면 프로젝트 선택
+cmux pick            # 기록 무시하고 프로젝트 선택 (Space: 다중선택, Enter: 열기)
+cmux /path/to/proj   # 경로 직접 열기 (세션이 살아 있으면 탭으로 추가)
 cmux add [경로]      # DEV_ROOT 외 경로 등록
 cmux rm              # 등록 경로 제거
 cmux list            # 프로젝트 목록
 cmux -l              # zellij 세션 목록
-cmux -k              # 세션 종료
+cmux -k              # 세션 재시작 — 같은 탭 복원 + 각 탭 Claude 대화 이어서 (세션 안/밖 모두)
+cmux kill            # 세션 종료만 (탭 기록 보존 → 다음 cmux가 복원)
 ```
+
+`cmux -k`를 세션 안(터미널 pane)에서 실행하면 세션이 종료된 직후 같은 터미널에서 자동으로 같은 탭이 다시 만들어집니다. 이 자동 복원은 `cmux`로 세션을 열었을 때 동작하며, `zellij attach`로 직접 붙은 경우에는 셸에서 `cmux`를 한 번 더 실행하면 됩니다. 세션이 죽은 상태에서 `cmux <경로>`를 실행하면 이전 탭들도 함께 복원되고 지정한 경로가 새 탭으로 추가됩니다(기록을 버리고 새로 시작하려면 `cmux pick`).
 
 ### 피커 조작
 
@@ -113,7 +120,7 @@ cmux -k              # 세션 종료
 
 > **zellij 충돌 노트**: `Ctrl+O`는 zellij 기본값(Session 모드)을 `unbind` 처리하여 Claude Code로 패스스루됩니다. zellij Session 모드는 `Ctrl+Shift+O`로 사용하세요.
 >
-> 세션이 살아있으면 다음에 `cmux` 실행 시 picker 없이 바로 재연결됩니다.
+> 세션이 살아있으면 다음에 `cmux` 실행 시 picker 없이 바로 재연결됩니다. 세션이 죽었으면 마지막 탭 구성을 그대로 복원하고 각 탭의 Claude 대화를 이어갑니다.
 
 ## 설정
 
