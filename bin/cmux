@@ -90,7 +90,8 @@ _kdl_tab() {
 
   local bar_line=""
   if [[ -n "$CMUX_BAR_BIN" && -x "$CMUX_BAR_BIN" ]]; then
-    bar_line="        pane size=1 borderless=true {
+    # zellij 0.45.1은 1행 터미널 pane을 렌더링하지 않으므로 2행 (내용 1행 + 아래 pane 프레임 행)
+    bar_line="        pane size=2 borderless=true {
             command \"/bin/zsh\"
             args \"-c\" \"while true; do ${CMUX_BAR_BIN}; sleep 1; done\"
         }"
@@ -122,7 +123,8 @@ _make_layout() {
 
   local bar_block=""
   if [[ -n "$CMUX_BAR_BIN" && -x "$CMUX_BAR_BIN" ]]; then
-    bar_block="        pane size=1 borderless=true {
+    # zellij 0.45.1은 1행 터미널 pane을 렌더링하지 않으므로 2행 (내용 1행 + 아래 pane 프레임 행)
+    bar_block="        pane size=2 borderless=true {
             command \"/bin/zsh\"
             args \"-c\" \"while true; do ${CMUX_BAR_BIN}; sleep 1; done\"
         }"
