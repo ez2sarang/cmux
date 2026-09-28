@@ -3,8 +3,8 @@
 # collar-dispatcher.sh 가 stdin을 파이프로 전달해 실행
 #
 # 트리거 방식 (우선순위):
-#   1순위: ctx% 기반 (transcript 파일 크기로 추정)
-#   2순위: 메시지 카운트 폴백 (transcript 없을 때)
+#   1순위: ctx% (transcript 의 실제 토큰 usage 기반 — Claude 네이티브 미터와 일치)
+#   2순위: 메시지 카운트 폴백 (transcript/usage 없을 때)
 
 # stdin에서 hook event JSON 읽기
 HOOK_DATA="$(cat)"
@@ -26,6 +26,7 @@ PROJECT_DIR="$(cd "$COLLAR_DIR/.." && pwd)"
 CTX_THRESHOLD=80   # %: 이 이상이면 compact 실행
 CTX_TARGET=15      # %: compact 목표 수준 (collar-compact에 전달)
 MSG_THRESHOLD=20   # 폴백: transcript 없을 때 메시지 카운트
+CTX_LIMIT=200000   # 컨텍스트 창 토큰 한도 (200K 기본; config 로 재정의 가능)
 AUTO_COMPACT=true
 
 if [ -f "$CONFIG_FILE" ]; then
@@ -37,6 +38,7 @@ try:
     print('CTX_THRESHOLD=' + str(w.get('ctx_percent_threshold', 60)))
     print('CTX_TARGET='    + str(w.get('ctx_percent_target', 15)))
     print('MSG_THRESHOLD=' + str(w.get('message_threshold', 20)))
+    print('CTX_LIMIT='     + str(w.get('context_token_limit', 200000)))
     print('AUTO_COMPACT='  + ('true' if w.get('auto_compact', True) else 'false'))
 except: pass
 " 2>/dev/null)"
@@ -96,11 +98,14 @@ PYEOF
   fi
 fi
 
-# ── ctx% 추정 ─────────────────────────────────────────────────────
-# Claude Code는 200K 토큰 컨텍스트를 사용.
-# transcript JSONL 파일 크기로 대화 누적량을 추정한다.
-# JSONL에서 실제 토큰으로의 변환 비율: ~37 bytes/token (tool 결과·파일 내용·JSON 래퍼 포함)
-# 200K tokens × 37 = 7.4MB → 100%  (실측: 1MB delta ≈ Claude Code ctx 14%, 역산 ~7MB=100%)
+# ── ctx% 측정 (실제 토큰 usage 기반) ───────────────────────────────
+# Claude Code transcript JSONL 의 마지막 메인스레드 assistant 턴 usage 에서
+# 실제 컨텍스트 점유량을 읽는다: input + cache_creation + cache_read
+# = 그 턴에 컨텍스트 창을 채운 실제 토큰 수 → Claude 네이티브 미터와 일치한다.
+# (구버전은 transcript 바이트 ÷ 7.4MB 로 "대화 증분"만 측정 → 스크린샷·tool 결과로
+#  바이트가 폭증하면 실제 토큰과 무관하게 100% 오탐 → 낮은 ctx 에서도 compact 폭주.
+#  transcript 는 compact 해도 줄지 않으므로 한번 커지면 영구 고정됨. usage 직접 읽기로 교체.)
+# 서브에이전트(isSidechain) 턴은 별도 컨텍스트이므로 제외한다.
 TRANSCRIPT="$(echo "$HOOK_DATA" | python3 -c "
 import json,sys
 try:
@@ -112,35 +117,69 @@ except: print('')
 CTX_PCT=0
 USE_MSG_FALLBACK=false
 
-if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
-  TRANSCRIPT_BYTES="$(wc -c < "$TRANSCRIPT" 2>/dev/null || echo 0)"
-  # compact 이후 delta로 ctx% 계산 (절대값 사용 시 compact 후에도 100% 오탐 발생)
-  BASELINE_FILE="$COLLAR_DIR/.transcript-baseline"
-  BASELINE_SESSION_FILE="$COLLAR_DIR/.baseline-session-id"
+# 동적 컨텍스트 한도: OMC stdin 캐시에서 네이티브 used_percentage / context_window_size 를
+# 읽어 200K/1M 세션을 자동 구분한다. (구버전 200K 하드코딩 → 1M 세션 5배 과대 → 거짓 compact)
+CTX_PCT="$(python3 - "$TRANSCRIPT" "$PROJECT_DIR" "$CTX_LIMIT" <<'PYEOF'
+import json, sys, os, glob
+transcript = sys.argv[1]
+project_dir = sys.argv[2]
+fallback_limit = int(sys.argv[3]) if sys.argv[3].isdigit() else 200000
 
-  # 세션 ID 추출 (transcript 파일명 = 세션 UUID)
-  CURRENT_SESSION_ID="$(basename "$TRANSCRIPT" .jsonl)"
-  SAVED_SESSION_ID=""
-  [ -f "$BASELINE_SESSION_FILE" ] && SAVED_SESSION_ID="$(cat "$BASELINE_SESSION_FILE" 2>/dev/null || echo '')"
+def load_cache():
+    cands = [os.path.join(project_dir, '.omc', 'state', 'hud-stdin-cache.json')]
+    cands += sorted(
+        glob.glob(os.path.join(project_dir, '.omc', 'state', 'sessions', '*', 'hud-stdin-cache.json')),
+        key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+    for p in cands:
+        try:
+            return json.load(open(p))
+        except Exception:
+            continue
+    return {}
 
-  BASELINE_BYTES=0
-  if [ "$CURRENT_SESSION_ID" != "$SAVED_SESSION_ID" ]; then
-    # 새 세션 감지 → baseline 리셋 (이전 세션 크기를 기준값으로 쓰면 delta가 음수가 됨)
-    echo "0" > "$BASELINE_FILE"
-    echo "$CURRENT_SESSION_ID" > "$BASELINE_SESSION_FILE"
-  else
-    [ -f "$BASELINE_FILE" ] && BASELINE_BYTES="$(cat "$BASELINE_FILE" 2>/dev/null || echo 0)"
-  fi
+cw = (load_cache() or {}).get('context_window', {}) or {}
 
-  DELTA_BYTES=$(( TRANSCRIPT_BYTES - BASELINE_BYTES ))
-  [ "$DELTA_BYTES" -lt 0 ] && DELTA_BYTES=0
-  # 200K tokens at 37 bytes/token (JSONL overhead) = 7,400,000 bytes (compact 이후 누적분만 측정)
-  CTX_PCT="$(python3 -c "print(int($DELTA_BYTES * 100 / 7400000))" 2>/dev/null || echo 0)"
-  # 100% 초과 클램핑
-  [ "$CTX_PCT" -gt 100 ] 2>/dev/null && CTX_PCT=100
-else
-  # transcript 경로 없음 → 메시지 카운트 폴백
+# 1) 네이티브 used_percentage 우선 (Claude Code 보고값 = HUD ctx: 와 동일)
+nat = cw.get('used_percentage')
+if isinstance(nat, (int, float)) and nat > 0:
+    print(min(int(round(nat)), 100)); sys.exit(0)
+
+# 2) transcript 마지막 메인스레드 턴 usage ÷ 동적 window size
+window = cw.get('context_window_size')
+if not (isinstance(window, (int, float)) and window > 0):
+    window = fallback_limit
+total = None
+if transcript and os.path.exists(transcript):
+    try:
+        lines = open(transcript).read().splitlines()
+    except Exception:
+        lines = []
+    for ln in reversed(lines):                 # 최신 턴부터 역순
+        try:
+            d = json.loads(ln)
+        except Exception:
+            continue
+        if d.get('isSidechain'):               # 서브에이전트 컨텍스트 제외
+            continue
+        msg = d.get('message') if isinstance(d.get('message'), dict) else {}
+        u = msg.get('usage') or d.get('usage')
+        if not isinstance(u, dict):
+            continue
+        total = (u.get('input_tokens', 0)
+                 + u.get('cache_creation_input_tokens', 0)
+                 + u.get('cache_read_input_tokens', 0))
+        break
+if total is None:
+    print(-1)                                  # usage·캐시 모두 없음 → 폴백 신호
+else:
+    pct = int(total * 100 / window) if window > 0 else 0
+    print(min(pct, 100))
+PYEOF
+)"
+CTX_PCT="${CTX_PCT:--1}"
+if [ "$CTX_PCT" -lt 0 ] 2>/dev/null; then
   USE_MSG_FALLBACK=true
+  CTX_PCT=0
 fi
 
 # ── 메시지 카운트 폴백 ─────────────────────────────────────────────
@@ -181,14 +220,16 @@ fi
 # 락 파일 갱신 → 5분간 재실행 방지
 touch "$LOCK_FILE"
 
-# compact 실행 (프로젝트 디렉토리 기준)
-cd "$PROJECT_DIR" && "$COLLAR_COMPACT_BIN" 2>/dev/null
+# compact 실행 (프로젝트 디렉토리 기준). COLLAR_TRANSCRIPT_PATH 로 hook-event JSON의
+# transcript_path(위에서 이미 추출한 $TRANSCRIPT)를 넘겨 "본문(진행 중 세션)" 파일을
+# mtime 추측이 아니라 정확히 지정한다.
+# fire-and-forget: LLM 호출이 1~3분 걸려 동기 실행 시 UserPromptSubmit 훅 60초 타임아웃을
+# 초과한다 (40-session-recovery.sh 의 검증된 백그라운드 detach 패턴과 동일하게 처리).
+( cd "$PROJECT_DIR" && COLLAR_TRANSCRIPT_PATH="$TRANSCRIPT" nohup "$COLLAR_COMPACT_BIN" >/dev/null 2>&1 & ) >/dev/null 2>&1
 
-# compact 직후 transcript baseline 저장 (다음 ctx% 계산 기준점)
-if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
-  wc -c < "$TRANSCRIPT" 2>/dev/null > "$COLLAR_DIR/.transcript-baseline" || true
-  basename "$TRANSCRIPT" .jsonl > "$COLLAR_DIR/.baseline-session-id" 2>/dev/null || true
-fi
+# (usage 기반 측정에서는 compact 후 다음 턴 usage 가 자동으로 줄므로
+#  별도의 transcript baseline 저장이 필요 없다 — 구버전 .transcript-baseline /
+#  .baseline-session-id 기준점 로직 제거됨.)
 
 # 카운터 리셋 (폴백 모드일 때)
 [ "$USE_MSG_FALLBACK" = "true" ] && echo "0" > "$COUNTER_FILE"
