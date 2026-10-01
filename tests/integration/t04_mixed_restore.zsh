@@ -7,9 +7,9 @@
 #   M5 밖에서 cmux -k → 혼재 4탭 재생성: 탭 이름·pane 이름·에이전트별 argv·배너
 #   M6 cmux kill → 기록 보존 → 무인자 cmux 복원
 #   M6b 세션 안(ZELLIJ 경로)에서 cmux -a opencode <delta> — 터미널 pane에 입력
-#   M6c 비-claude 탭 닫기 → kill 동기화가 기록에서 뺀다 (탭 이름 `·` 접미사 파싱)
 #   M7 구버전(a1a07e9) 롤백 — 혼재 기록에서 claude 탭만 복원 (비-claude 탭만 빠짐)
 #   M8 구버전 롤백 — 새 버전이 쓴 claude 전용 기록을 그대로 복원
+#   M9 비-claude 탭 닫기 → kill 동기화가 기록에서 뺀다 (탭 이름 `·` 접미사 파싱)
 # 이력: alpha=claude 대화형 세션, beta=codex 대화형 롤아웃, gamma=opencode 세션(M5부터 목록에 나타남)
 
 source "${0:A:h}/../lib/harness.zsh"
@@ -211,19 +211,6 @@ t_assert_eq "session-tabs 뒤에 delta<TAB>opencode" "$TABS4"$'\n'"$DELTA${T}ope
 t_assert_true "cmux-tab-opencode.kdl 생성" 'grep -qF "args \"launch\" \"--agent\" \"opencode\"" "$CMUX_LAYOUTS_DIR/cmux-tab-opencode.kdl"'
 t_assert_eq "기존 4탭 재실행 없음" "3 3 3 3" "$(_launches)"
 
-t_scenario M6c "비-claude 탭 닫기 → kill 동기화가 기록에서 뺀다 (탭 이름 접미사 파싱)"
-_close_gamma() {
-  _t_guard && t_zj_gate && zellij -s "$T_SESSION" action go-to-tab-name "gamma·opencode" 2>/dev/null \
-    && zellij -s "$T_SESSION" action close-tab 2>/dev/null
-}
-t_wait_for '_close_gamma' 10
-_assert_eventually "gamma·opencode 탭 닫힘" $'alpha\nbeta·codex\nalpha·codex\ndelta·opencode' t_tab_names 10
-_close_client
-t_cmux 30 kill
-t_assert_true "세션 없음·에이전트 0" 't_session_gone && (( $(t_agent_procs) == 0 ))' 10
-t_assert_eq "기록 = 실제 탭 (닫은 gamma·opencode 제외, 에이전트 유지)" \
-  "$ALPHA"$'\n'"$BETA${T}codex"$'\n'"$ALPHA${T}codex"$'\n'"$DELTA${T}opencode" "$(t_tabs_file)"
-t_assert_not_contains "모든 탭 매핑 → 병합 경고 없음" "$(cat "$T_LAST_LOG")" "경로를 알 수 없는 탭"
 
 # ── M7 ────────────────────────────────────────────────
 OLD_REV="${T_OLD_REV:-a1a07e9}"
@@ -264,7 +251,41 @@ else
   t_scenario M7 "구버전 롤백"
   t_skip "git show $OLD_REV 실패 — 롤백 실험 생략"
 fi
-t_hup
+
+# ── M9 ────────────────────────────────────────────────
+t_scenario M9 "비-claude 탭 닫기 → kill 동기화가 기록에서 뺀다 (탭 이름 · 접미사 파싱)"
+_close_client
+t_cmux 30 kill
+t_assert_true "세션 없음·에이전트 0" 't_session_gone && (( $(t_agent_procs) == 0 ))' 10
+N9_OPEN=$'alpha\nbeta·codex\ngamma·opencode\nalpha·codex'
+N9_LEFT=$'alpha\nbeta·codex\nalpha·codex'
+_close_gamma() {
+  _t_guard && t_zj_gate && zellij -s "$T_SESSION" action go-to-tab-name "gamma·opencode" 2>/dev/null \
+    && zellij -s "$T_SESSION" action close-tab 2>/dev/null
+}
+# _m9_try — 혼재 4탭 복원 → gamma·opencode 닫기 → 창 닫기 → cmux kill. 동기화가 기록을 썼으면 0.
+#   기록 mtime을 2020년으로 돌려 두고 kill 뒤에도 그대로면 = 동기화가 쓰지 않음(1).
+#   _tabs_sync_live는 zellij 조회(list-sessions/query-tab-names)가 실패하면 조용히 넘어간다(기존 동작, 견고화는 P2-C) —
+#   전체 실행 중 드물게(실측 1/27) 일어나 그때만 1회 다시 시도한다. 동기화가 아예 안 도는 회귀는 두 번 다 실패한다.
+_m9_try() {
+  print -r -l -- "$ALPHA" "$BETA${T}codex" "$GAMMA${T}opencode" "$ALPHA${T}codex" > "$CMUX_TABS_FILE"
+  t_cmux_bg 120
+  t_assert_true "혼재 4탭 복원" '[[ "$(t_tab_names)" == "$N9_OPEN" ]]' 20
+  t_wait_for '_close_gamma' 10
+  t_assert_true "gamma·opencode 탭 닫힘" '[[ "$(t_tab_names)" == "$N9_LEFT" ]]' 10
+  _close_client
+  touch -t 202001010000 "$CMUX_TABS_FILE"
+  t_cmux 30 kill
+  t_wait_for 't_session_gone && (( $(t_agent_procs) == 0 ))' 10
+  [[ "$(stat -f %Sm -t %Y "$CMUX_TABS_FILE")" != 2020 ]]
+}
+if ! _m9_try; then
+  print -r -- "  진단: kill의 탭 동기화가 기록을 쓰지 않음 (zellij 조회 실패 추정 — P2-C 범위) — 1회 다시 시도"
+  _m9_try
+fi
+t_assert_eq "기록 = 실제 탭 (닫은 gamma·opencode 제외, 에이전트 유지)" \
+  "$ALPHA"$'\n'"$BETA${T}codex"$'\n'"$ALPHA${T}codex" "$(t_tabs_file)"
+t_assert_not_contains "모든 탭 매핑 → 병합 경고 없음" "$(cat "$T_LAST_LOG")" "경로를 알 수 없는 탭"
 
 t_finish
 exit $?

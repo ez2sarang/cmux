@@ -129,9 +129,24 @@ _ag_claude_perm_args() {
 _ag_claude_session_file() {
   local dir="${1:-$PWD}"
   local cfg="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
-  # 키는 [A-Za-z0-9-]뿐이라 glob 대안 (a|b)에 그대로 넣어도 안전 — 두 폴더를 한 번에 최신순 정렬
   local -aU keys=("${dir//[^A-Za-z0-9]/-}" "${${dir:A}//[^A-Za-z0-9]/-}")
-  local -a files=("$cfg"/projects/(${~${(j:|:)keys}})/*.jsonl(Nom))
+  local -a files=() m stamped=()
+  local k f
+  # 폴더는 키별 직접 경로로 연다 — 대소문자 무시 볼륨(APFS)에서 폴더 이름의 대소문자가 키와 달라도
+  # (예: 키 …-totalviewer, 실제 폴더 …-totalViewer) OS가 찾는다. glob 대안 (a|b)는 디렉토리 목록을
+  # 대소문자 구분으로 비교해 이런 폴더를 놓친다.
+  if (( ${#keys} == 1 )); then
+    files=("$cfg/projects/${keys[1]}"/*.jsonl(Nom))
+  else
+    # 논리·물리 키가 다르면 두 폴더 파일을 합쳐 mtime 최신순 (zstat은 내장 — 파일마다 fork 없음)
+    for k in "${keys[@]}"; do
+      for f in "$cfg/projects/$k"/*.jsonl(N); do
+        zstat -A m +mtime -- "$f" 2>/dev/null || m=(0)
+        stamped+=("${m[1]}"$'\t'"$f")
+      done
+    done
+    files=("${(@)${(@On)stamped}#*$'\t'}")
+  fi
   (( ${#files} )) || return 1
   REPLY="$(print -rN -- "${files[@]}" \
     | LC_ALL=C xargs -0 grep -m1 -n -o -H --line-buffered '"entrypoint"[[:space:]]*:[[:space:]]*"[^"]*"' -- 2>/dev/null \
@@ -202,24 +217,47 @@ _ag_codex_compose() {
   reply=("${reply[@]}" "$@")
 }
 
+# python 조각 (codex·opencode 공용): dir_matcher(d) → same(p) = 기록된 경로 p가 디렉토리 d와 같은 폴더인가.
+#   정확 일치(d 또는 realpath(d))가 먼저. 아니면 폴더 이름(basename)이 대소문자 무시로 같은 기록만
+#   os.path.samefile로 최종 확인한다 — 대소문자 무시 볼륨에서 대소문자만 다르게 기록된 경로(…/totalViewer vs
+#   …/totalviewer)와 심볼릭 링크 경로로 기록된 것을 같은 폴더로 본다. 대소문자 구분 볼륨에선 samefile이 거짓이라
+#   오탐이 없고, 이름이 다른 기록은 stat하지 않는다(목록 1000개·끊긴 볼륨에서도 빠르게).
+_AG_PY_DIR_MATCHER='
+import os
+def dir_matcher(d):
+    want = {d, os.path.realpath(d)}
+    bases = {os.path.basename(w.rstrip("/")).lower() for w in want}
+    def same(p):
+        if not isinstance(p, str) or not p:
+            return False
+        if p in want:
+            return True
+        if os.path.basename(p.rstrip("/")).lower() not in bases:
+            return False
+        try:
+            return os.path.samefile(p, d)
+        except OSError:
+            return False
+    return same
+'
+
 # 마지막 활동: ${CODEX_HOME:-~/.codex}/sessions/**/rollout-*.jsonl 중 mtime 최신 40개만 본다.
-# 첫 줄 session_meta의 payload.cwd가 dir(논리·물리)이고 payload.source가 exec가 아닌 것 중 가장 최근 mtime.
+# 첫 줄 session_meta의 payload.cwd가 dir와 같은 폴더(dir_matcher)이고 payload.source가 exec가 아닌 것 중 가장 최근 mtime.
 # 포맷이 바뀌었거나 python3가 없으면 조용히 0.
 _ag_codex_last_activity() {
   local dir="${1:-$PWD}"
   local -a files=("${CODEX_HOME:-$HOME/.codex}"/sessions/**/rollout-*.jsonl(N.om[1,40]))
   REPLY=0
   (( ${#files} )) && command -v python3 >/dev/null 2>&1 || return 0
-  REPLY="$(python3 -c '
-import json, os, sys
-d = sys.argv[1]
-want = {d, os.path.realpath(d)}
+  REPLY="$(python3 -c "$_AG_PY_DIR_MATCHER"'
+import json, sys
+same = dir_matcher(sys.argv[1])
 for f in sys.argv[2:]:                      # mtime 최신순
     try:
         with open(f, encoding="utf-8") as fh:
             meta = json.loads(fh.readline())
         p = meta.get("payload") or {}
-        if meta.get("type") == "session_meta" and p.get("cwd") in want and p.get("source") != "exec":
+        if meta.get("type") == "session_meta" and same(p.get("cwd")) and p.get("source") != "exec":
             print(int(os.stat(f).st_mtime))
             break
     except Exception:
@@ -240,7 +278,8 @@ _ag_opencode_bin() {
 # 권한 플래그 없음 — 전역 설정(permission: allow)에 의존. auto/safe 모두 빈 배열 = 기본 구현
 
 # 이어갈 세션: '<bin> --pure session list --format json -n 1000'(cwd=dir, 8초 제한)에서
-# directory가 dir 또는 realpath(dir)인 것 중 updated(ms) 최대. 목록은 프로젝트 단위라 다른 directory가 섞인다(S4).
+# directory가 dir와 같은 폴더(dir_matcher — 정확 일치 우선, 대소문자·심볼릭 링크 차이는 samefile 확인)인 것 중
+# updated(ms) 최대. 목록은 프로젝트 단위라 다른 directory가 섞인다(S4).
 # 결과: _ag_opencode_sid(없으면 빈 값), _ag_opencode_updated(epoch 초, 없으면 0).
 # 실패·시간 초과·파싱 오류·python3 없음은 조용히 "없음"(= 새 대화).
 typeset -g _ag_opencode_sid="" _ag_opencode_updated=0
@@ -249,17 +288,17 @@ _ag_opencode_probe() {
   _ag_opencode_sid="" _ag_opencode_updated=0
   _agent_call opencode bin || return 1
   command -v python3 >/dev/null 2>&1 || return 1
-  out="$(python3 -c '
-import json, os, subprocess, sys
+  out="$(python3 -c "$_AG_PY_DIR_MATCHER"'
+import json, subprocess, sys
 b, d = sys.argv[1], sys.argv[2]
-want = {d, os.path.realpath(d)}
+same = dir_matcher(d)
 try:
     r = subprocess.run([b, "--pure", "session", "list", "--format", "json", "-n", "1000"], cwd=d,
                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8)
     best = None
     for s in json.loads(r.stdout):
         u = s.get("updated")
-        if s.get("directory") in want and s.get("id") and isinstance(u, (int, float)) and (best is None or u > best[1]):
+        if s.get("id") and isinstance(u, (int, float)) and (best is None or u > best[1]) and same(s.get("directory")):
             best = (s["id"], u)
     if best:
         print(best[0], int(best[1]) // 1000)

@@ -5,10 +5,10 @@
 #   A2 bin 탐색 우선순위 (_ag_search_bin / codex / opencode — 가짜 홈·PATH)
 #   A3 권한 프로파일 (CMUX_<A>_PERM 오버라이드·기본값·잘못된 값) + perm_args
 #   A4 인자 조립 compose (codex 서브커맨드 뒤 권한 인자 / claude·opencode 기본 순서)
-#   A5 opencode has_history·last_activity (가짜 'session list' JSON: 디렉토리 일치·불일치·논리/물리·updated 최대·
-#      빈 목록·깨진 JSON·시간 초과·python3 없음)
-#   A6 codex last_activity·has_history (rollout 첫 줄 session_meta: cwd·source·최신 40개 창·CODEX_HOME)
-#   A7 claude last_activity·has_history 배너 설명 (sdk-cli 제외, 논리·물리 키를 합쳐 최신순)
+#   A5 opencode has_history·last_activity (가짜 'session list' JSON: 디렉토리 일치·불일치·논리/물리·대소문자 차이(samefile)·
+#      updated 최대·빈 목록·깨진 JSON·시간 초과·python3 없음)
+#   A6 codex last_activity·has_history (rollout 첫 줄 session_meta: cwd(대소문자 차이 포함)·source·최신 40개 창·CODEX_HOME)
+#   A7 claude last_activity·has_history 배너 설명 (sdk-cli 제외, 논리·물리 키를 합쳐 최신순, 세션 폴더 대소문자 차이)
 #   A8 마커 판정 _handoff_marker_due (TTL·유예 경계 ±1초, 에이전트 불일치, 깨진 파일)
 #   A9 마커 소비 _handoff_marker_consume (원자적 mv, 두 번째는 일반 경로, mv 실패, 동시 소비 경합)
 #   A10 _collar_agents_sync (.collar·PATH 조건, 인자, 출력 버림, exit 2/3 경고, 2초 타임박스)
@@ -58,6 +58,10 @@ _path_without_sync() {
   for e in "${path[@]}"; do [[ -x "$e/collar-agents-sync" ]] || p+=("$e"); done
   print -r -- "${(j.:.)p}"
 }
+# 임시 루트가 대소문자 무시 볼륨(APFS 기본)인가 — 대소문자 차이 회귀 테스트의 전제
+mkdir -p "$U_TMP/CaseProbe"
+[[ -d "$U_TMP/caseprobe" ]] && U_CI=1 || U_CI=0
+rmdir "$U_TMP/CaseProbe"
 NOW=$EPOCHSECONDS
 SAFE="-a never -s workspace-write"
 BYPASS="--dangerously-bypass-approvals-and-sandbox"
@@ -221,7 +225,22 @@ _oclist "$(_oce ses_phys "$OC/a" 1790000000000)"
 t_assert_eq "논리 경로(심볼릭 링크)로 물어도 물리 경로 기록 → 있음" "0|ses_phys|ses_phys|1790000000" "$(_ohh "$U_TMP/oclink/a")"
 _oclist "$(_oce ses_logi "$U_TMP/oclink/a" 1790000000000)"
 t_assert_eq "논리 경로 기록 + 논리 경로로 물음 → 있음" "0|ses_logi|ses_logi|1790000000" "$(_ohh "$U_TMP/oclink/a")"
-t_assert_eq "논리 경로 기록 + 물리 경로로 물음 → 모름(없음)" "1|||0" "$(_ohh "$OC/a")"
+t_assert_eq "논리 경로 기록 + 물리 경로로 물음 → 같은 폴더(samefile) → 있음" "0|ses_logi|ses_logi|1790000000" "$(_ohh "$OC/a")"
+# 기록된 directory의 대소문자가 실제 폴더 이름과 다름 (대소문자 무시 볼륨에서 같은 폴더)
+mkdir -p "$OC/caseproj" "$OC/other/caseproj"
+if (( U_CI )); then
+  _oclist "$(_oce ses_case "$OC/CaseProj" 1790000000000)"
+  t_assert_eq "대소문자만 다른 directory 기록 → 같은 폴더 → 있음" "0|ses_case|ses_case|1790000000" "$(_ohh "$OC/caseproj")"
+  _oclist "$(_oce ses_exact "$OC/caseproj" 1790000000000)" "$(_oce ses_case "$OC/CASEPROJ" 1790000100000)"
+  t_assert_eq "정확 일치·대소문자 차이 기록이 섞이면 같은 폴더 중 updated 최대" "0|ses_case|ses_case|1790000100" "$(_ohh "$OC/caseproj")"
+else
+  t_skip "대소문자 차이 directory — 임시 루트가 대소문자 구분 볼륨"
+  t_skip "대소문자 차이 + 정확 일치 혼합"
+fi
+_oclist "$(_oce ses_twin "$OC/other/CaseProj" 1799999999999)" "$(_oce ses_near "$OC/CaseProjX" 1799999999999)"
+t_assert_eq "이름이 같아도 다른 폴더(samefile 거짓)·이름이 다른 기록 → 없음" "1|||0" "$(_ohh "$OC/caseproj")"
+_oclist "$(_oce ses_gone "$OC/gone/CaseProj" 1799999999999)"
+t_assert_eq "없는 경로 기록 → 없음 (오류 없이)" "1|||0" "$(_ohh "$OC/caseproj")"
 _oclist
 t_assert_eq "빈 목록 → 없음" "1|||0" "$(_ohh "$OC/a")"
 print -r -- '[{"id":"ses_x","directory":' > "$FAKE_OPENCODE_LIST"
@@ -283,6 +302,17 @@ t_assert_eq "깨진 첫 줄·session_meta 아닌 첫 줄은 건너뜀" $(( NOW -
 t_assert_eq "논리 경로로 물어도 물리 cwd 기록 → 일치" $(( NOW - 300 )) "$(_cla "$U_TMP/cxlink/a")"
 t_assert_eq "판정 중 stderr 출력 없음" "" "$(_ag_codex_last_activity "$CX/a" 2>&1 >/dev/null)"
 t_assert_eq "python3 없음 → 0" 0 "$(PATH="$U_TMP/emptybin" _cla "$CX/a")"
+# cwd 기록의 대소문자가 실제 폴더 이름과 다름 / 이름은 같지만 다른 폴더
+mkdir -p "$CX/caseproj" "$CX/other/caseproj"
+_rollout r6 "$CX/other/caseproj" cli $(( NOW - 240 ))
+t_assert_eq "이름(caseproj)만 같은 다른 폴더의 기록 → 0" 0 "$(_cla "$CX/caseproj")"
+if (( U_CI )); then
+  _rollout r5 "$CX/CaseProj" cli $(( NOW - 250 ))
+  t_assert_eq "대소문자만 다른 cwd 기록 → 같은 폴더 → 그 mtime (이름만 같은 다른 폴더의 더 최신 기록은 무시)" \
+    $(( NOW - 250 )) "$(_cla "$CX/caseproj")"
+else
+  t_skip "대소문자 차이 cwd — 임시 루트가 대소문자 구분 볼륨"
+fi
 # has_history: 프로브 없이 항상 0 (native resume --last), REPLY = 마지막 활동 시각 또는 안내
 strftime -s want '%m-%d %H:%M' $(( NOW - 300 ))
 REPLY=""; _agent_call codex has_history "$CX/a"
@@ -331,6 +361,25 @@ _tr "$U_TMP/cllink/y" logi cli $(( NOW - 80 )); _tr "$U_TMP/clreal/y" phys cli $
 t_assert_eq "물리 키 쪽이 더 최신 → 그 mtime" $(( NOW - 50 )) "$(_lla "$U_TMP/cllink/y")"
 _tr "$U_TMP/cllink/y" logi2 sdk-cli $(( NOW - 10 ))
 t_assert_eq "합친 목록에서도 sdk-cli 제외" $(( NOW - 50 )) "$(_lla "$U_TMP/cllink/y")"
+# 두 폴더가 시각상 엇갈림 — 논리: cli -60·sdk -20 / 물리: cli -40·sdk -30 → 합친 최신순으로 물리의 -40
+# (폴더를 차례로 보면 논리 폴더의 cli -60을 먼저 고른다)
+mkdir -p "$U_TMP/clreal/z"
+_tr "$U_TMP/cllink/z" lc cli $(( NOW - 60 )); _tr "$U_TMP/cllink/z" ls sdk-cli $(( NOW - 20 ))
+_tr "$U_TMP/clreal/z" pc cli $(( NOW - 40 )); _tr "$U_TMP/clreal/z" ps sdk-cli $(( NOW - 30 ))
+t_assert_eq "두 키 폴더의 파일을 합쳐 최신순 (엇갈린 시각)" $(( NOW - 40 )) "$(_lla "$U_TMP/cllink/z")"
+# 회귀(2026-10-01 실데이터 totalviewer): 세션 폴더 이름의 대소문자가 cwd 키와 다름 —
+# 대소문자 무시 볼륨에서는 claude가 그 폴더를 쓰므로 이력이 있다
+mkdir -p "$CL/casedir" "$CL/casesdk"
+if (( U_CI )); then
+  _tr "$CL/CaseDir" s1 cli $(( NOW - 600 ))                 # 세션 폴더 …-CaseDir, 프로젝트 폴더 casedir
+  t_assert_eq "세션 폴더 대소문자가 키와 다름 → 이력 있음" $(( NOW - 600 )) "$(_lla "$CL/casedir")"
+  REPLY=""; _ag_claude_has_history "$CL/casedir"
+  t_assert_eq "세션 폴더 대소문자가 키와 다름 → has_history 0" 0 $?
+  _tr "$CL/CaseSdk" s1 sdk-cli $(( NOW - 600 ))
+  t_assert_eq "대소문자 다른 세션 폴더에 sdk-cli만 → 0 (스캔은 그대로)" 0 "$(_lla "$CL/casesdk")"
+else
+  t_skip "세션 폴더 대소문자 차이 — 임시 루트가 대소문자 구분 볼륨"
+fi
 
 # ── A8 ────────────────────────────────────────────────
 t_scenario A8 "마커 판정 _handoff_marker_due — TTL·유예 경계, 에이전트 불일치, 깨진 파일"
