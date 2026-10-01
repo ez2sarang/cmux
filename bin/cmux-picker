@@ -2,7 +2,13 @@
 """
 cmux-picker — 수평 탭 스타일 프로젝트 피커
 curses로 /dev/tty 직접 제어 → command substitution 안에서도 동작
-선택된 프로젝트 경로를 stdout(원본 파이프)으로 출력
+선택된 프로젝트를 stdout(원본 파이프)으로 한 줄씩 출력:
+  유효 에이전트가 설정된 default면 `경로`만(구버전 호환), 다르면 `경로<TAB>에이전트`
+
+에이전트 선택 입력(cmux가 env로 넘김, 모두 선택 사항 — 없으면 claude 하나 = 기존 화면·출력 그대로):
+  CMUX_PICKER_AGENTS         등록된 에이전트(공백 구분, 순서 = a/Tab 순환 순서)
+  CMUX_PICKER_DEFAULT_AGENT  설정된 default (기본 claude)
+  CMUX_PICKER_PREFS_FILE     프로젝트별 마지막 사용 에이전트(`경로<TAB>에이전트`) — 읽기만 한다
 """
 
 import curses
@@ -11,6 +17,8 @@ import sys
 
 DEV_ROOT = os.environ.get("CMUX_ROOT", os.path.expanduser("~/Documents/dev/ai"))
 EXTRAS_FILE = os.path.expanduser("~/.config/cmux/projects")
+
+KEY_TAB = 9
 
 
 def get_projects():
@@ -46,13 +54,116 @@ def get_projects():
     return projects
 
 
-def compute_all_positions(names, w):
+# ── 에이전트 선택 (curses와 무관한 순수 로직 — tests/unit/t30_picker_unit.zsh) ──
+def parse_agents(value):
+    """CMUX_PICKER_AGENTS(공백 구분) → 등록 순서 유지·중복 제거. 비어 있으면 claude 하나."""
+    agents = []
+    for a in value.split():
+        if a not in agents:
+            agents.append(a)
+    return agents or ["claude"]
+
+
+def parse_prefs(path, agents):
+    """마지막 사용 에이전트 파일(`경로<TAB>에이전트` 줄들) → {경로: 에이전트}.
+
+    읽기 전용 — 파일이 없거나 읽을 수 없으면 기억 없음. 같은 경로가 여러 줄이면 마지막 줄이고,
+    그 에이전트가 등록 목록에 없으면(미설치 등) 기억 없음으로 취급해 선택 기본을 따른다.
+    """
+    prefs = {}
+    if not path:
+        return prefs
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                p, sep, a = line.rstrip("\n").partition("\t")
+                if sep and p:
+                    prefs[p] = a.strip()
+    except (OSError, UnicodeDecodeError):
+        return {}
+    return {p: a for p, a in prefs.items() if a in agents}
+
+
+def compute_effective_agent(path, explicit, prefs, base):
+    """유효 에이전트 = a로 명시 변경 > 기억값 > 선택 기본.
+
+    기억 파일은 cmux가 realpath로 기록하므로 picker 경로(CMUX_ROOT 기준 논리 경로)의 물리 경로도 찾는다.
+    """
+    if path in explicit:
+        return explicit[path]
+    return prefs.get(path) or prefs.get(os.path.realpath(path)) or base
+
+
+def next_agent(agents, current):
+    """등록 순서대로 다음 에이전트 (목록에 없으면 첫 항목)."""
+    if current not in agents:
+        return agents[0]
+    return agents[(agents.index(current) + 1) % len(agents)]
+
+
+def agent_badge(agent, base):
+    """선택 기본과 다를 때만 `[codex]` 같은 배지, 같으면 빈 문자열."""
+    return "" if agent == base else f"[{agent}]"
+
+
+def serialize_selection(paths, agent_of, default):
+    """출력 줄 — 유효 에이전트가 설정된 default면 `경로`만(구버전 호환), 다르면 `경로<TAB>에이전트`."""
+    lines = []
+    for p in paths:
+        a = agent_of(p)
+        lines.append(p if a == default else f"{p}\t{a}")
+    return lines
+
+
+class AgentChoice:
+    """picker 한 번 동안의 에이전트 선택 상태."""
+
+    def __init__(self, agents, default, prefs):
+        self.agents = agents
+        # 설정된 default — 출력에서 `경로`만 쓸지의 기준. 등록 목록에 없어도 그대로 둔다
+        # (그 경우 모든 항목이 `경로<TAB>에이전트`로 나가 cmux가 default로 오해할 여지가 없다)
+        self.default = default
+        self.base = default if default in agents else agents[0]  # 선택 기본 — Tab으로 순환
+        self.prefs = prefs
+        self.explicit = {}  # a로 명시 변경한 항목: {경로: 에이전트}
+
+    @classmethod
+    def from_env(cls, env):
+        agents = parse_agents(env.get("CMUX_PICKER_AGENTS", ""))
+        default = env.get("CMUX_PICKER_DEFAULT_AGENT", "").strip() or "claude"
+        return cls(agents, default, parse_prefs(env.get("CMUX_PICKER_PREFS_FILE", ""), agents))
+
+    @property
+    def enabled(self):
+        """등록 에이전트가 2개 이상일 때만 안내줄·a/Tab 키가 동작한다 (1개면 기존 화면 그대로)."""
+        return len(self.agents) > 1
+
+    def effective(self, path):
+        return compute_effective_agent(path, self.explicit, self.prefs, self.base)
+
+    def badge(self, path):
+        return agent_badge(self.effective(path), self.base)
+
+    def on_key(self, k, path):
+        """a: 커서 항목 에이전트 순환(명시 변경), Tab: 선택 기본 순환. 그 외 키·등록 1개면 무시."""
+        if not self.enabled:
+            return
+        if k == ord("a"):
+            self.explicit[path] = next_agent(self.agents, self.effective(path))
+        elif k == KEY_TAB:
+            self.base = next_agent(self.agents, self.base)
+
+    def output_lines(self, paths):
+        return serialize_selection(paths, self.effective, self.default)
+
+
+def compute_all_positions(names, w, badges):
     """모든 항목의 논리적 (logical_row, col, idx, tab_w) 위치 계산."""
     positions = []
     row, col = 0, 2
 
     for i, name in enumerate(names):
-        label = f" {name} "
+        label = f" {name} " + (f"{badges[i]} " if badges[i] else "")
         tab_w = len(label) + 2
 
         if col + tab_w > w - 2:
@@ -65,7 +176,8 @@ def compute_all_positions(names, w):
     return positions
 
 
-def draw(stdscr, names, cursor, selected, scroll_offset, all_positions):
+def draw(stdscr, names, cursor, selected, scroll_offset, all_positions, badges, base):
+    """base: 선택 기본 에이전트 — 등록 에이전트가 1개면 None(안내 없이 기존 화면 그대로)."""
     stdscr.erase()
     h, w = stdscr.getmaxyx()
 
@@ -75,6 +187,7 @@ def draw(stdscr, names, cursor, selected, scroll_offset, all_positions):
     C_NORMAL   = curses.color_pair(4)
     C_DIM      = curses.color_pair(5)
     C_ACCENT   = curses.color_pair(6)
+    C_BADGE    = curses.color_pair(7)
 
     # ── 타이틀 ────────────────────────────────────────
     title = f" cmux — 프로젝트 선택 ({len(names)}개) "
@@ -82,6 +195,15 @@ def draw(stdscr, names, cursor, selected, scroll_offset, all_positions):
         stdscr.addstr(0, max(0, (w - len(title)) // 2), title, C_TITLE | curses.A_BOLD)
     except curses.error:
         pass
+
+    # ── 에이전트 안내 (빈 row 1 — 등록 2개 이상일 때만) ──
+    if base:
+        try:
+            stdscr.addstr(1, 2, "기본 에이전트: ", C_DIM)
+            stdscr.addstr(base, C_BADGE | curses.A_BOLD)
+            stdscr.addstr("   a:에이전트 Tab:기본", C_DIM)
+        except curses.error:
+            pass
 
     # ── 가시 영역: screen row 2 ~ h-4 ────────────────
     visible_height = h - 5
@@ -120,19 +242,23 @@ def draw(stdscr, names, cursor, selected, scroll_offset, all_positions):
             continue
 
         label = f" {names[i]} "
+        badge = f"{badges[i]} " if badges[i] else ""  # 선택 기본과 다른 에이전트만 `[codex] `
+        end = col + 1 + len(label) + len(badge)
         try:
             if i == cursor:
                 stdscr.addstr(screen_row, col,     "▶",    C_ACCENT)
                 stdscr.addstr(screen_row, col + 1, label,  C_CURSOR | curses.A_BOLD)
-                stdscr.addstr(screen_row, col + 1 + len(label), "◀", C_ACCENT)
+                stdscr.addstr(screen_row, end,     "◀",    C_ACCENT)
             elif i in selected:
                 stdscr.addstr(screen_row, col,     "●",    C_SELECTED | curses.A_BOLD)
                 stdscr.addstr(screen_row, col + 1, label,  C_SELECTED | curses.A_BOLD)
-                stdscr.addstr(screen_row, col + 1 + len(label), "●", C_SELECTED | curses.A_BOLD)
+                stdscr.addstr(screen_row, end,     "●",    C_SELECTED | curses.A_BOLD)
             else:
                 stdscr.addstr(screen_row, col,     " ",    C_NORMAL)
                 stdscr.addstr(screen_row, col + 1, label,  C_NORMAL)
-                stdscr.addstr(screen_row, col + 1 + len(label), " ", C_NORMAL)
+                stdscr.addstr(screen_row, end,     " ",    C_NORMAL)
+            if badge:
+                stdscr.addstr(screen_row, col + 1 + len(label), badge, C_BADGE | curses.A_BOLD)
         except curses.error:
             pass
 
@@ -184,7 +310,7 @@ def read_key(stdscr):
         stdscr.timeout(-1)
 
 
-def picker_ui(stdscr, projects):
+def picker_ui(stdscr, projects, choice):
     names = [os.path.basename(p) for p in projects]
 
     curses.curs_set(0)
@@ -197,6 +323,7 @@ def picker_ui(stdscr, projects):
     curses.init_pair(4, curses.COLOR_WHITE,  -1)
     curses.init_pair(5, 8,                   -1)
     curses.init_pair(6, curses.COLOR_YELLOW, -1)
+    curses.init_pair(7, curses.COLOR_MAGENTA, -1)
 
     cursor = 0
     selected = set()
@@ -204,9 +331,11 @@ def picker_ui(stdscr, projects):
 
     while True:
         h, w = stdscr.getmaxyx()
-        all_positions = compute_all_positions(names, w)
+        badges = [choice.badge(p) for p in projects]
+        all_positions = compute_all_positions(names, w, badges)
 
-        scroll_offset = draw(stdscr, names, cursor, selected, scroll_offset, all_positions)
+        scroll_offset = draw(stdscr, names, cursor, selected, scroll_offset, all_positions,
+                             badges, choice.base if choice.enabled else None)
 
         k = read_key(stdscr)
 
@@ -245,6 +374,9 @@ def picker_ui(stdscr, projects):
                 if below:
                     cursor = min(below, key=lambda p: abs(p[1] - curr[1]))[2]
 
+        else:  # a: 커서 항목 에이전트 순환, Tab: 선택 기본 순환 (그 외 키는 무시)
+            choice.on_key(k, projects[cursor])
+
     return []
 
 
@@ -258,6 +390,8 @@ def main():
         print(f"⚠ 표시할 프로젝트가 없습니다 (DEV_ROOT: {DEV_ROOT})", file=sys.stderr)
         sys.exit(1)
 
+    choice = AgentChoice.from_env(os.environ)
+
     old_stdin  = os.dup(0)
     old_stdout = os.dup(1)
 
@@ -266,7 +400,7 @@ def main():
     os.dup2(tty.fileno(), 1)
 
     try:
-        results = curses.wrapper(picker_ui, projects)
+        results = curses.wrapper(picker_ui, projects, choice)
     except KeyboardInterrupt:
         # cbreak(ISIG 유지) 상태라 Ctrl+C는 getch()에서 KeyboardInterrupt로 터진다.
         # 트레이스백 + 비정상 종료코드를 내면 호출부(bin/cmux)가 "프로젝트 선택기
@@ -279,8 +413,8 @@ def main():
         os.close(old_stdout)
         tty.close()
 
-    for path in results:
-        sys.stdout.write(path + "\n")
+    for line in choice.output_lines(results):
+        sys.stdout.write(line + "\n")
     sys.stdout.flush()
 
 
