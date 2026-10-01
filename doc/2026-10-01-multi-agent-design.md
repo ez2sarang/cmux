@@ -33,6 +33,8 @@ claude 외 codex / opencode / gemini(/ aider)를 같은 형태(탭별 자동 시
 - 어댑터 훅(에이전트당 `_ag_<name>_<hook>`, 없으면 기본 구현): `bin`(경로 탐색: `CMUX_<A>_BIN` → brew/`~/.local/bin`/`~/.nvm/versions/node/*/bin`/`~/.bun/bin` → `command -v`), `perm_args <profile>`(auto|safe), `resume_mode`(native|probe|none), `has_history <dir>`, `resume_args`, `fresh_args`, `label`, `fastfail`(초).
 - `cmux launch [dir] --agent <a>`: cd → 어댑터 해석 → 마커 확인 → 자식으로 실행(**exec 아님**) → `rc≠0 && SECONDS<fastfail`이면 fresh 인자로 1회 재실행. 바이너리 없음/인증 실패면 pane에 사유 1줄 + `exec zsh -i`(탭·나머지 복원은 계속). 재개 시 pane 첫 줄에 `재개: <agent> <id/시각>` 배너.
 - `agents.conf` 한 줄: `name|bin후보(콜론구분)|perm_args|resume_args|fresh_args|fastfail`. 커스텀 probe는 `_ag_<name>_has_history` 함수.
+- **구현된 훅 규약(P2-A, `bin/cmux-agents.zsh` 머리말이 기준)**: `bin`→`REPLY` / `default_perm`→`REPLY`(기본 auto, codex safe) / `perm_args <auto|safe>`→`reply` / `has_history <dir>`→rc 0이면 이어하기, `REPLY`=배너용 설명(id·시각, 비어도 됨) / `last_activity <dir>`→`REPLY`=가장 최근 **대화형** 세션 활동 epoch 초(없으면 0, 마커 유예 판정용) / `resume_args`·`fresh_args`→`reply` / `compose <resume|fresh> <권한 인자…>`→`reply`=실행 인자 전체(기본: 권한 인자 + resume_args/fresh_args, codex는 서브커맨드 뒤에 권한 인자) / `fastfail`·`label`→`REPLY`. `resume_mode` 훅은 두지 않았다 — native 재개(codex)는 `has_history`가 항상 0을 돌려주는 것으로 표현한다. 프로파일은 `_agent_perm_profile <a>`: env `CMUX_<대문자 a>_PERM`(auto|safe) > `default_perm`, 그 외 값은 경고 1줄 후 기본값. 공용 도우미 `_ag_search_bin <이름> <후보…>`(env → `-f && -x`인 첫 후보 → `command -v`).
+- **구현된 `_launch_agent` 순서(P2-A)**: 실행 파일 확인(없으면 사유 + `exec zsh -i`) → 비-claude면 `_collar_agents_sync`(§8) → 권한 프로파일·인자 조립 → `_handoff_marker_consume`(§6, 소비 시 fresh) → 아니면 `has_history` → 배너 1줄(회색 `\e[90m`, stdout = pane 터미널): `▶ <label>: 이전 대화 이어서 시작 [<설명>]` / `▶ <label>: 핸드오프 직후 — 새로 시작` / `▶ <label>: 새로 시작` → 실행(자식) + fastfail(`1≤rc≤128`이고 fastfail초 안이면 fresh 1회). 배너와 마커 소비는 claude에도 동일 적용.
 
 ## 4. 데이터 포맷
 - `session-tabs`: 줄당 `경로` 또는 `경로<TAB>에이전트`. TAB 없음 = claude. `_tabs_load`는 항상 정규화(`경로<TAB>에이전트`) 출력. **`_tabs_save`/`_tabs_append`는 claude 항목을 `경로`만(구포맷과 동일)으로, 비-claude 항목만 `경로<TAB>에이전트`로 기록**한다 — 구버전 cmux로 롤백해도 claude 탭 복원이 깨지지 않게(구버전은 TAB 줄을 `[[ -d ]]` 실패로 조용히 버림 → 비-claude 탭만 빠짐). 비-claude 줄을 처음 쓰기 직전 `session-tabs.bak-<날짜>` 1회. dedupe는 정규화된 spec 단위(같은 경로 + 같은 에이전트만 중복). 설치본·레포본 동시 교체 필수.
@@ -54,9 +56,23 @@ claude 외 codex / opencode / gemini(/ aider)를 같은 형태(탭별 자동 시
 
 zellij 서버 PATH는 대화형 셸에서 서버를 띄운 덕에 지금은 nvm bin을 포함(실측)하지만 보장이 아니다 → 어댑터는 절대경로 후보 + nvm glob 폴백.
 
+**P2-A 구현 결과 (2026-10-01)**
+| | codex | opencode |
+|---|---|---|
+| 바이너리 탐색 | `CMUX_CODEX_BIN` → `/opt/homebrew/bin/codex` → `/usr/local/bin/codex` → `~/.nvm/versions/node/*/bin/codex`(링크 대상 mtime 최신 하나) → `~/.bun/bin/codex` → `command -v` | `CMUX_OPENCODE_BIN` → nvm(같은 규칙) → `~/.bun/bin/opencode` → `/opt/homebrew/bin/opencode` → `/usr/local/bin/opencode` → `command -v` |
+| 권한 | 기본 **safe** `-a never -s workspace-write`, `CMUX_CODEX_PERM=auto` → `--dangerously-bypass-approvals-and-sandbox` | auto/safe 모두 플래그 없음 |
+| 실행 인자 | 이어하기 `codex resume --last <권한…>` / 새로 `codex <권한…>`. **순서 실측**(0.159.3, `--help` 파싱만): `codex resume --last -a never -s workspace-write --help`·`codex -a never -s workspace-write resume --last --help`·`--dangerously-bypass…` 두 순서 모두 rc=0. 파서는 `--help`가 있어도 인자를 검증한다(`--bogus-flag` → rc=2 "unexpected argument", `-a nope` → rc=2 "invalid value"). `codex resume --help`가 `-a/-s/--dangerously-bypass…`를 자기 옵션으로 나열 → resume 서브커맨드 뒤 순서 채택(루트 옵션 병합에 기대지 않음) | 이어하기 `opencode -s <id>` / 새로 플래그 없음 |
+| 이력 판정 | 프로브 없음 — `has_history`는 항상 0(native `resume --last`, 이력 없으면 codex가 새 입력창). 배너 설명 = `last_activity` 시각 또는 "이력이 없으면 새 대화" | python3(표준 라이브러리) 1회: `<bin> --pure session list --format json -n 1000`(cwd=dir, `subprocess` timeout 8초) → `directory`가 dir 또는 realpath(dir)인 항목 중 `updated` 최대의 `id`. 실패·시간 초과·깨진 JSON·python3 없음 → 이력 없음(조용히). 실측 키(1.18.32, `-n 3`): `created,directory,id,projectId,title,updated`(ms) |
+| last_activity | `${CODEX_HOME:-~/.codex}/sessions/**/rollout-*.jsonl` 중 mtime 최신 40개, 첫 줄 `type=session_meta`의 `payload.cwd`가 dir(논리·물리)이고 `payload.source != "exec"`인 것의 mtime(최신순 첫 일치). 실측 첫 줄 ~20KB, `source` 값 `cli`/`vscode`/`exec` | 위 목록의 `updated`/1000(내림) |
+| fastfail | 5초 | 5초(없는 id → rc=1 즉시 종료 → 새 대화 1회) |
+| trust 프롬프트 | 자동 처리 안 함(S3 결정) | — |
+
+claude: `has_history`/`last_activity`는 같은 grep+awk 스캔(`_ag_claude_session_file`)이 "가장 최근 대화형 세션 파일"을 돌려주게 바꿨다 — 논리·물리 경로 키 두 폴더를 한 glob(`(키1|키2)/*.jsonl(Nom)`)으로 합쳐 최신순 정렬. `has_history`의 배너 설명 = 그 파일 mtime(`MM-DD HH:MM`), `last_activity` = 그 mtime.
+
 ## 6. 핸드오프 인식 재개 (D1)
 - 기본은 재개(재부팅/크래시 복원). **수동 `collar-handoff` 성공 시에만** `.collar/restart-fresh` 마커를 쓴다(`collar-handoff` L106 `.compact-lock` touch 옆). 내용(**구현됨: 한 줄에 키 하나**, 줄 단위로 파싱할 것): `agent=<name>` / `handoff=<HANDOFF 파일명 또는 ->` / `ts=<epoch 초>`. 쓰기는 `.collar/.restart-fresh.tmp.$$` → `mv`(원자적). `COLLAR_AGENT`(기본 claude)는 영문·숫자·`_`·`-`만 허용(아니면 마커 미작성+경고). 자동 경로(SessionEnd 안전망·워치독·밀도 자동 handoff)는 **절대** 마커를 쓰지 않는다.
-- `cmux launch`는 해당 에이전트와 `agent=`가 일치할 때만 소비: TTL 48h 이내 && 그 에이전트의 최신 non-sdk-cli 트랜스크립트 mtime ≤ 마커 mtime(핸드오프 후 대화를 이미 재개했다면 무시) → resume 플래그를 생략하고 fresh 시작(SessionStart 주입에 맡김). 소비는 `mv`(원자적)로 `.collar/.restart-fresh.consumed-<ts>` 보존. 같은 프로젝트의 다른 에이전트 탭은 영향 없음.
+- `cmux launch`는 해당 에이전트와 `agent=`가 일치할 때만 소비: TTL 48h 이내 && 그 에이전트의 최신 대화형 트랜스크립트 mtime ≤ 마커 `ts` + **유예 `CMUX_HANDOFF_GRACE`(기본 300초)** (핸드오프 *뒤에 실제로 대화를 이어갔다면* 무시 — 핸드오프가 최신이 아니므로 이어하기가 맞다). **유예가 필요한 이유(설계 결함 정정)**: `collar-handoff` 명령의 출력이 마커를 쓴 *직후* 트랜스크립트에 기록되므로 "mtime ≤ 마커 mtime"은 정상 흐름에서도 항상 거짓이다 → resume 플래그를 생략하고 fresh 시작(SessionStart 주입에 맡김). 소비는 `mv`(원자적)로 `.collar/.restart-fresh.consumed-<ts>` 보존. 같은 프로젝트의 다른 에이전트 탭은 영향 없음.
+- **구현(P2-A, `bin/cmux`)**: 판정은 순수 함수 `_handoff_marker_due <agent> <dir> <now>`(줄 단위 `agent=`/`ts=`만 읽음, 마지막 값 우선, `ts`는 숫자만, 그 외 키·빈 줄 무시) — 조건 `agent==에이전트` && `now - ts ≤ 172800` && `last_activity(dir) ≤ ts + 유예`(경계 포함, `CMUX_HANDOFF_GRACE`가 숫자가 아니면 300). 깨진·빈 마커·CRLF·디렉토리는 조용히 무시, 미래 `ts`(시계 차)는 TTL 안으로 본다. 소비 `_handoff_marker_consume <agent>` = 판정 후 `mv .collar/restart-fresh .collar/.restart-fresh.consumed-<now>`; **mv 실패 = 다른 pane이 먼저 소비 → 마커 없음과 같이 일반 경로**. 실측(테스트): 동시 소비 8개 중 정확히 1개 성공, 같은 폴더 동시 launch 2개 → fresh 1·이어하기 1.
 - collar-handoff 안내 문구: cmux 환경에서는 "`cmux -k`" 안내를 추가(claude `-c` 금지 경고는 유지).
 
 ## 7. 혼재 재부팅 복원 견고성 (R1)

@@ -491,6 +491,63 @@ _pick_flow() {
 }
 
 # ── 에이전트 실행 (pane 진입점) ───────────────────────
+# 핸드오프 마커 .collar/restart-fresh (설계 §6) — 수동 collar-handoff 성공 때만 collar가 쓴다.
+# 내용은 줄마다 키 하나: agent=<이름> / handoff=<HANDOFF 파일명|-> / ts=<epoch 초>.
+# _handoff_marker_due <에이전트> <디렉토리> <지금(epoch 초)> — 이 에이전트가 소비할 마커면 0
+#   agent= 일치 && ts가 48시간 안 && 그 에이전트의 마지막 대화 활동 ≤ ts + CMUX_HANDOFF_GRACE(기본 300초).
+#   유예가 필요한 이유: collar-handoff 명령의 출력은 마커를 쓴 직후 트랜스크립트에 기록되므로 "활동 ≤ ts"는
+#   정상 흐름에서도 거짓이다. 유예보다 늦은 활동 = 핸드오프 뒤에 대화를 이어간 것 → 이어하기가 맞다.
+#   다른 에이전트용·TTL 초과·유예 초과 마커는 건드리지 않는다. 깨진·빈 마커는 조용히 무시.
+_handoff_marker_due() {
+  local agent="$1" file="$2/.collar/restart-fresh" now="$3" line m_agent="" m_ts=""
+  local grace="${CMUX_HANDOFF_GRACE:-300}"
+  [[ "$grace" == <-> ]] || grace=300
+  [[ -f "$file" && -r "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      agent=*) m_agent="${line#agent=}" ;;
+      ts=*)    m_ts="${line#ts=}" ;;
+    esac
+  done < "$file"
+  [[ "$m_agent" == "$agent" && "$m_ts" == <-> ]] || return 1
+  (( now - m_ts <= 172800 )) || return 1
+  _agent_call "$agent" last_activity "$2"
+  (( REPLY <= m_ts + grace ))
+}
+
+# _handoff_marker_consume <에이전트> — $PWD의 마커를 소비했으면 0.
+#   소비 = .collar/.restart-fresh.consumed-<epoch>로 원자적 mv. mv 실패 = 다른 pane이 먼저 소비 → 마커 없음과 같다.
+_handoff_marker_consume() {
+  local now=$EPOCHSECONDS
+  _handoff_marker_due "$1" "$PWD" "$now" || return 1
+  mv -- "$PWD/.collar/restart-fresh" "$PWD/.collar/.restart-fresh.consumed-$now" 2>/dev/null
+}
+
+# 비-claude 에이전트 시작 전 AGENTS.md의 collar 블록 갱신 (collar-agents-sync <dir>, 설계 §8)
+# $PWD/.collar가 있고 PATH에 collar-agents-sync가 있을 때만. 2초 타임박스(넘으면 종료시키고 진행), 출력은 버린다.
+# 실패해도 launch는 계속 — exit 2(블록 마커 손상)·3(AGENTS.md가 심볼릭 링크)만 경고 1줄.
+_collar_agents_sync() {
+  [[ -d "$PWD/.collar" ]] || return 0
+  local sync rc i=0
+  sync="$(command -v collar-agents-sync 2>/dev/null)" || return 0
+  "$sync" "$PWD" </dev/null >/dev/null 2>&1 &
+  local pid=$!
+  while kill -0 $pid 2>/dev/null && (( i++ < 20 )); do sleep 0.1; done
+  if kill -0 $pid 2>/dev/null; then
+    kill $pid 2>/dev/null
+    wait $pid 2>/dev/null
+    return 0
+  fi
+  wait $pid
+  rc=$?
+  case $rc in
+    2) _warn "AGENTS.md의 collar 블록 마커가 깨져 갱신하지 않았습니다 (collar-agents-sync exit 2)" ;;
+    3) _warn "AGENTS.md가 심볼릭 링크라 collar 블록을 갱신하지 않았습니다 (collar-agents-sync exit 3)" ;;
+  esac
+  return 0
+}
+
+# 순서: 실행 파일 확인 → (비-claude) collar-agents-sync → 핸드오프 마커 소비 → 이어하기 판정 → 배너 1줄 → 실행.
 # 이전 대화가 있으면 이어하기 인자를 붙인다. 이어하기가 곧바로 실패하면(fastfail초 안에 rc 1~128로 종료)
 # 새 대화로 1회만 다시 실행한다 — 예: claude 폴더에 요약(sdk-cli) 세션만 있어 --continue가 rc=1로 끝날 때.
 # 신호로 끝난 경우(rc>128 — pane 닫기·Ctrl+C·kill)는 실패가 아니므로 다시 실행하지 않는다.
@@ -507,19 +564,33 @@ _launch_agent() {
   fi
   local bin="$REPLY"
 
-  local -a perm resume fresh
-  _agent_call "$agent" perm_args auto; perm=("${reply[@]}")
-  _agent_call "$agent" fresh_args;     fresh=("${reply[@]}")
-  _agent_call "$agent" has_history "$PWD" && { _agent_call "$agent" resume_args; resume=("${reply[@]}") }
+  [[ "$agent" != claude ]] && _collar_agents_sync
 
-  if (( ${#resume} )); then
+  local -a perm resume fresh
+  _agent_perm_profile "$agent"
+  _agent_call "$agent" perm_args "$REPLY";        perm=("${reply[@]}")
+  _agent_call "$agent" compose fresh "${perm[@]}"; fresh=("${reply[@]}")
+
+  local resuming=0 banner
+  if _handoff_marker_consume "$agent"; then
+    banner="핸드오프 직후 — 새로 시작"
+  elif REPLY="" && _agent_call "$agent" has_history "$PWD"; then
+    banner="이전 대화 이어서 시작${REPLY:+ [$REPLY]}"
+    _agent_call "$agent" compose resume "${perm[@]}"; resume=("${reply[@]}")
+    resuming=1
+  else
+    banner="새로 시작"
+  fi
+  echo "${_c_gray}▶ ${label}: ${banner}${_c_reset}"
+
+  if (( resuming )); then
     _agent_call "$agent" fastfail
     local fastfail="$REPLY" t0=$SECONDS rc
-    "$bin" "${perm[@]}" "${resume[@]}"
+    "$bin" "${resume[@]}"
     rc=$?
     (( rc >= 1 && rc <= 128 && SECONDS - t0 < fastfail )) || return $rc
   fi
-  "$bin" "${perm[@]}" "${fresh[@]}"
+  "$bin" "${fresh[@]}"
 }
 
 # 테스트용: 함수 정의만 로드하고 디스패처는 실행하지 않는다 (CMUX_SOURCE_ONLY=1 source bin/cmux)

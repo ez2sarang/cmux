@@ -151,7 +151,8 @@ t_assert_true "세션 종료·에이전트 0" 't_session_gone && (( $(t_agent_pr
 n_none="$(t_agent_launches claude "$P_NONE")"
 t_cmux 10 launch --agent nope "$P_NONE"
 t_assert_eq "알 수 없는 에이전트 → exit 1" 1 "$T_LAST_RC"
-t_assert_contains "오류 메시지" "$(cat "$T_LAST_LOG")" "알 수 없는 에이전트: 'nope' (사용 가능: claude)"
+# P2-A: 등록 에이전트 확장 (사용 가능 목록 claude → claude codex opencode)
+t_assert_contains "오류 메시지" "$(cat "$T_LAST_LOG")" "알 수 없는 에이전트: 'nope' (사용 가능: claude codex opencode)"
 t_cmux 10 launch "$P_NONE" --agent
 t_assert_eq "--agent 값 없음 → exit 1" 1 "$T_LAST_RC"
 t_assert_eq "오류일 때 에이전트 실행 없음" "$n_none" "$(t_agent_launches claude "$P_NONE")"

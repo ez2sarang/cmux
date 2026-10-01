@@ -1,17 +1,23 @@
 # cmux-agents.zsh — 에이전트 어댑터 (bin/cmux가 source 한다. 단독 실행용 아님)
 #
 # 어댑터 훅: 에이전트마다 _ag_<이름>_<훅> 함수. 없으면 _agent_call이 _ag_default_<훅>을 쓴다.
-#   bin               실행 파일 경로 → REPLY (못 찾으면 비0)
-#   perm_args <prof>  권한 인자 (auto|safe) → reply 배열
-#   has_history <dir> 그 디렉토리에 이어갈 대화가 있으면 0
-#   resume_args       이어하기 인자 → reply 배열
-#   fresh_args        새 대화 인자 → reply 배열
-#   fastfail          이 시간(초) 안에 이어하기가 비0 종료하면 새 대화로 1회 재실행 → REPLY
-#   label             표시 이름 → REPLY
+#   bin                   실행 파일 경로 → REPLY (못 찾으면 비0)
+#   default_perm          권한 프로파일 기본값(auto|safe) → REPLY. env CMUX_<이름>_PERM이 우선 (_agent_perm_profile)
+#   perm_args <prof>      권한 인자 (auto|safe) → reply 배열
+#   has_history <dir>     그 디렉토리에 이어갈 대화가 있으면 0 — REPLY에 배너용 짧은 설명(id·시각, 비어도 됨)
+#   last_activity <dir>   그 디렉토리의 가장 최근 대화형 세션 활동 시각(epoch 초, 없으면 0) → REPLY (핸드오프 마커 유예 판정)
+#   resume_args           이어하기 인자 → reply 배열
+#   fresh_args            새 대화 인자 → reply 배열
+#   compose <resume|fresh> <권한 인자...>  실행 인자 전체 → reply 배열 (기본: 권한 인자 + resume_args/fresh_args)
+#   fastfail              이 시간(초) 안에 이어하기가 비0 종료하면 새 대화로 1회 재실행 → REPLY
+#   label                 표시 이름 → REPLY
 # install.sh도 source 하므로(set -u) 미설정 변수는 기본값 문법으로 읽는다.
 
+zmodload zsh/datetime            # strftime, EPOCHSECONDS (bin/cmux의 핸드오프 마커 판정도 쓴다)
+zmodload -F zsh/stat b:zstat     # zstat만 — 외부 stat 명령은 가리지 않는다
+
 # 등록된 에이전트 — 기본 에이전트는 claude
-CMUX_AGENTS=(claude)
+CMUX_AGENTS=(claude codex opencode)
 
 _agent_known() {
   [[ -n "$1" ]] && (( ${CMUX_AGENTS[(Ie)$1]} ))
@@ -28,6 +34,41 @@ _agent_call() {
   fi
 }
 
+# _agent_perm_profile <이름> — 권한 프로파일 → REPLY. env CMUX_<이름>_PERM(auto|safe), 없으면 default_perm.
+#   알 수 없는 값은 경고 1줄 후 기본값
+_agent_perm_profile() {
+  local var="CMUX_${(U)1}_PERM"
+  _agent_call "$1" default_perm
+  case "${(P)var:-}" in
+    "") ;;
+    auto|safe) REPLY="${(P)var}" ;;
+    *) _warn "${var}='${(P)var}' — auto|safe 가 아니라 기본값(${REPLY})을 씁니다" ;;
+  esac
+}
+
+# ── 공용 도우미 ───────────────────────────────────────
+# _ag_search_bin <이름> <후보 경로...> — env CMUX_<이름>_BIN → 실행 가능한 첫 후보 → PATH (REPLY, 없으면 비0)
+_ag_search_bin() {
+  local name="$1" var="CMUX_${(U)1}_BIN" c
+  shift
+  REPLY="${(P)var:-}"
+  [[ -n "$REPLY" ]] && return 0
+  for c in "$@"; do
+    [[ -f "$c" && -x "$c" ]] && { REPLY="$c"; return 0 }
+  done
+  REPLY="$(command -v "$name" 2>/dev/null)"
+  [[ -n "$REPLY" ]]
+}
+
+# _ag_mtime <파일> — 수정 시각(epoch 초) → REPLY, 못 읽으면 0
+_ag_mtime() {
+  local -a m
+  if zstat -A m +mtime -- "$1" 2>/dev/null; then REPLY="${m[1]}"; else REPLY=0; fi
+}
+
+# _ag_fmt_time <epoch> — 배너용 "MM-DD HH:MM" → REPLY
+_ag_fmt_time() { strftime -s REPLY '%m-%d %H:%M' "$1" }
+
 # ── 기본 구현 ─────────────────────────────────────────
 # 환경변수 CMUX_<이름>_BIN → PATH
 _ag_default_bin() {
@@ -36,12 +77,20 @@ _ag_default_bin() {
   [[ -z "$REPLY" ]] && REPLY="$(command -v "$1" 2>/dev/null)"
   [[ -n "$REPLY" ]]
 }
-_ag_default_perm_args()   { reply=() }
-_ag_default_has_history() { return 1 }
-_ag_default_resume_args() { reply=() }
-_ag_default_fresh_args()  { reply=() }
-_ag_default_fastfail()    { REPLY=5 }
-_ag_default_label()       { REPLY="$1" }
+_ag_default_default_perm()  { REPLY=auto }
+_ag_default_perm_args()     { reply=() }
+_ag_default_has_history()   { return 1 }
+_ag_default_last_activity() { REPLY=0 }
+_ag_default_resume_args()   { reply=() }
+_ag_default_fresh_args()    { reply=() }
+_ag_default_fastfail()      { REPLY=5 }
+_ag_default_label()         { REPLY="$1" }
+_ag_default_compose() {
+  local name="$1" mode="$2"
+  shift 2
+  _agent_call "$name" "${mode}_args"
+  reply=("$@" "${reply[@]}")
+}
 
 # ── claude ────────────────────────────────────────────
 _ag_claude_label() { REPLY="Claude Code" }
@@ -69,24 +118,22 @@ _ag_claude_perm_args() {
   fi
 }
 
-# 이어갈 대화형 세션: $CLAUDE_CONFIG_DIR/projects/<경로의 [^A-Za-z0-9]→-> /*.jsonl (논리·물리 경로 키 둘 다)
+# 가장 최근 대화형 세션 파일 → REPLY (없으면 비0)
+# 세션: $CLAUDE_CONFIG_DIR/projects/<경로의 [^A-Za-z0-9]→-> /*.jsonl (논리·물리 경로 키 둘 다, 합쳐서 최신순)
 # sdk-cli 세션만 있는 폴더에서 'claude --continue'는 "No conversation found to continue"로
 # rc=1 즉시 종료하므로 'claude -p' 요약 세션(collar-compact 등, entrypoint=sdk-cli)은 이력으로 치지 않는다.
 # 판정은 파일마다 앞 30줄 안의 첫 "entrypoint" 키 — sdk-cli면 요약 세션. 키가 없거나 못 읽는 파일은 이력으로 본다.
 # 파일 수와 무관하게 프로세스는 grep·awk 둘: grep이 파일마다 첫 실제 키를 "경로:줄:키"로 내고(본문 속
 # \"entrypoint\"는 따옴표가 이스케이프돼 안 맞는다), awk가 최신 파일부터 보다 요약 세션이 아닌 파일을 처음 만나면 멈춘다.
 # (awk 단독은 긴 첫 줄 때문에 sdk-cli 1000개에 ~0.4초 — grep은 ~0.17초)
-_ag_claude_has_history() {
+_ag_claude_session_file() {
   local dir="${1:-$PWD}"
   local cfg="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
+  # 키는 [A-Za-z0-9-]뿐이라 glob 대안 (a|b)에 그대로 넣어도 안전 — 두 폴더를 한 번에 최신순 정렬
   local -aU keys=("${dir//[^A-Za-z0-9]/-}" "${${dir:A}//[^A-Za-z0-9]/-}")
-  local -a files=()
-  local k
-  for k in "${keys[@]}"; do
-    files+=("$cfg/projects/$k"/*.jsonl(Nom))
-  done
+  local -a files=("$cfg"/projects/(${~${(j:|:)keys}})/*.jsonl(Nom))
   (( ${#files} )) || return 1
-  print -rN -- "${files[@]}" \
+  REPLY="$(print -rN -- "${files[@]}" \
     | LC_ALL=C xargs -0 grep -m1 -n -o -H --line-buffered '"entrypoint"[[:space:]]*:[[:space:]]*"[^"]*"' -- 2>/dev/null \
     | LC_ALL=C awk -v list=/dev/fd/3 '
         BEGIN { while ((getline l < list) > 0) want[++n] = l; i = 1 }
@@ -99,9 +146,137 @@ _ag_claude_has_history() {
           if ($0 !~ /"sdk-cli"$/) { found = 1; exit }           # 첫 키가 sdk-cli가 아님 → 대화형 세션
           i++
         }
-        END { exit !(found || i <= n) }' 3<<< "${(F)files}"
+        END { if (found || i <= n) print want[i]; else exit 1 }' 3<<< "${(F)files}")"
+  [[ -n "$REPLY" ]]
+}
+
+# 이어갈 대화형 세션이 있으면 0, REPLY = 그 세션의 마지막 활동 시각
+_ag_claude_has_history() {
+  _ag_claude_session_file "${1:-$PWD}" || return 1
+  _ag_mtime "$REPLY"
+  _ag_fmt_time "$REPLY"
+}
+
+# 마지막 활동 = 가장 최근 대화형 세션 파일의 mtime
+_ag_claude_last_activity() {
+  if _ag_claude_session_file "${1:-$PWD}"; then _ag_mtime "$REPLY"; else REPLY=0; fi
 }
 
 _ag_claude_resume_args() { reply=(--continue) }
 # fresh_args: 기본 구현(인자 없음)
 _ag_claude_fastfail()    { REPLY=5 }
+
+# ── codex ─────────────────────────────────────────────
+_ag_codex_label() { REPLY="Codex" }
+
+# 바이너리 탐색: CMUX_CODEX_BIN → brew → /usr/local → nvm(가장 최근 mtime 하나) → bun → PATH
+_ag_codex_bin() {
+  local -a nvm=("$HOME"/.nvm/versions/node/*/bin/codex(N-*om[1]))
+  _ag_search_bin codex /opt/homebrew/bin/codex /usr/local/bin/codex "${nvm[@]}" "$HOME/.bun/bin/codex"
+}
+
+# 기본 safe — 가드 훅(설계 §2 ③)이 codex로 포팅되기 전까지 전면 우회를 기본으로 하지 않는다 (D6)
+_ag_codex_default_perm() { REPLY=safe }
+_ag_codex_perm_args() {
+  if [[ "$1" == "auto" ]]; then
+    reply=(--dangerously-bypass-approvals-and-sandbox)
+  else
+    reply=(-a never -s workspace-write)
+  fi
+}
+
+# 이어하기는 codex가 판정한다(native): 'resume --last'는 cwd가 정확히 같은 대화형 세션만 고르고(exec 제외)
+# 없으면 새 입력창으로 시작한다(S3 실측) → 이력 프로브 없이 항상 이어하기. '--all'(다른 폴더 세션까지)은 쓰지 않는다.
+# 신규 폴더의 trust 프롬프트는 자동 처리하지 않는다(보안 결정을 cmux가 대신하지 않음 — S3).
+_ag_codex_has_history() {
+  _ag_codex_last_activity "${1:-$PWD}"
+  if (( REPLY )); then _ag_fmt_time "$REPLY"; else REPLY="이력이 없으면 새 대화"; fi
+  return 0
+}
+_ag_codex_resume_args() { reply=(resume --last) }
+# 인자 순서: 서브커맨드 뒤에 권한 인자 — 'codex resume --last -a never -s workspace-write'
+# (codex 0.159.3 실측: 'codex <권한> resume --last'도 파싱되지만 resume 서브커맨드 자신의 옵션으로 넘긴다)
+_ag_codex_compose() {
+  _agent_call codex "${1}_args"
+  shift
+  reply=("${reply[@]}" "$@")
+}
+
+# 마지막 활동: ${CODEX_HOME:-~/.codex}/sessions/**/rollout-*.jsonl 중 mtime 최신 40개만 본다.
+# 첫 줄 session_meta의 payload.cwd가 dir(논리·물리)이고 payload.source가 exec가 아닌 것 중 가장 최근 mtime.
+# 포맷이 바뀌었거나 python3가 없으면 조용히 0.
+_ag_codex_last_activity() {
+  local dir="${1:-$PWD}"
+  local -a files=("${CODEX_HOME:-$HOME/.codex}"/sessions/**/rollout-*.jsonl(N.om[1,40]))
+  REPLY=0
+  (( ${#files} )) && command -v python3 >/dev/null 2>&1 || return 0
+  REPLY="$(python3 -c '
+import json, os, sys
+d = sys.argv[1]
+want = {d, os.path.realpath(d)}
+for f in sys.argv[2:]:                      # mtime 최신순
+    try:
+        with open(f, encoding="utf-8") as fh:
+            meta = json.loads(fh.readline())
+        p = meta.get("payload") or {}
+        if meta.get("type") == "session_meta" and p.get("cwd") in want and p.get("source") != "exec":
+            print(int(os.stat(f).st_mtime))
+            break
+    except Exception:
+        pass
+' "$dir" "${files[@]}" 2>/dev/null)"
+  [[ "$REPLY" == <-> ]] || REPLY=0
+}
+
+# ── opencode ──────────────────────────────────────────
+_ag_opencode_label() { REPLY="OpenCode" }
+
+# 바이너리 탐색: CMUX_OPENCODE_BIN → nvm(가장 최근 mtime 하나) → bun → brew → /usr/local → PATH
+_ag_opencode_bin() {
+  local -a nvm=("$HOME"/.nvm/versions/node/*/bin/opencode(N-*om[1]))
+  _ag_search_bin opencode "${nvm[@]}" "$HOME/.bun/bin/opencode" /opt/homebrew/bin/opencode /usr/local/bin/opencode
+}
+
+# 권한 플래그 없음 — 전역 설정(permission: allow)에 의존. auto/safe 모두 빈 배열 = 기본 구현
+
+# 이어갈 세션: '<bin> --pure session list --format json -n 1000'(cwd=dir, 8초 제한)에서
+# directory가 dir 또는 realpath(dir)인 것 중 updated(ms) 최대. 목록은 프로젝트 단위라 다른 directory가 섞인다(S4).
+# 결과: _ag_opencode_sid(없으면 빈 값), _ag_opencode_updated(epoch 초, 없으면 0).
+# 실패·시간 초과·파싱 오류·python3 없음은 조용히 "없음"(= 새 대화).
+typeset -g _ag_opencode_sid="" _ag_opencode_updated=0
+_ag_opencode_probe() {
+  local dir="${1:-$PWD}" out
+  _ag_opencode_sid="" _ag_opencode_updated=0
+  _agent_call opencode bin || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  out="$(python3 -c '
+import json, os, subprocess, sys
+b, d = sys.argv[1], sys.argv[2]
+want = {d, os.path.realpath(d)}
+try:
+    r = subprocess.run([b, "--pure", "session", "list", "--format", "json", "-n", "1000"], cwd=d,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8)
+    best = None
+    for s in json.loads(r.stdout):
+        u = s.get("updated")
+        if s.get("directory") in want and s.get("id") and isinstance(u, (int, float)) and (best is None or u > best[1]):
+            best = (s["id"], u)
+    if best:
+        print(best[0], int(best[1]) // 1000)
+except Exception:
+    pass
+' "$REPLY" "$dir" 2>/dev/null)"
+  local -a f=(${=out})
+  (( ${#f} == 2 )) && [[ "${f[2]}" == <-> ]] || return 1
+  _ag_opencode_sid="${f[1]}" _ag_opencode_updated="${f[2]}"
+}
+_ag_opencode_has_history() {
+  _ag_opencode_probe "${1:-$PWD}" || return 1
+  REPLY="$_ag_opencode_sid"
+}
+_ag_opencode_last_activity() {
+  _ag_opencode_probe "${1:-$PWD}"
+  REPLY="$_ag_opencode_updated"
+}
+# 없는 id면 'opencode -s'가 rc=1로 즉시 끝난다(S4) → fastfail(기본 5초)로 새 대화 1회
+_ag_opencode_resume_args() { reply=(-s "$_ag_opencode_sid") }

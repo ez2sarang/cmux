@@ -10,6 +10,7 @@
 - 금지: `kill-all-sessions`·`delete-all-sessions`·`pkill zellij`. 정리 대상은 자기 세션과, 명령줄에 자기 임시 루트·고유 sleep 값·세션명이 있는 프로세스뿐이다.
 - 사용자 홈 설정(`~/.config/cmux`, `~/.config/zellij`, `~/.claude`, `~/.local/bin`)에는 쓰지 않는다. `cmux add/rm`은 `~/.config/cmux/projects`에 쓰므로 테스트하지 않는다.
 - 새 테스트 작성: `tests/integration/tNN_*.zsh`에서 `source ../lib/harness.zsh` → `t_live_snapshot; t_setup` → `t_scenario`/`t_cmux`/`t_cmux_bg`/`t_hup`/`t_assert_*`/`t_wait_for` → `t_finish; exit $?`.
+- codex·opencode·마커·sync 테스트(t03, P2-A): `fake-opencode --pure session list …`는 에이전트 실행이 아니라 목록 조회 흉내다 — `FAKE_OPENCODE_LIST=<JSON 파일>`의 내용을 출력하고 끝나며, 기록 첫 칸은 `fake-opencode-list`(실행 기록 `fake-opencode`와 구분). `FAKE_OPENCODE_LIST_SLEEP=<초>`이면 출력 없이 그 시간 대기한다(8초 시간 초과 확인용, 단위 테스트가 ~8초 걸린다). 실제 `~/.codex`·collar 설치본을 쓰지 않도록 t03은 `CODEX_HOME`을 임시 루트(단위는 가짜 `HOME`)로 두고, PATH 맨 앞에 가짜 `collar-agents-sync`(호출 기록, `FAKE_SYNC_SLEEP`·`FAKE_SYNC_RC`)를 둔다. 격리 zellij pane에서 `cmux launch <dir> --agent <a>`를 띄울 때는 cmux 레이아웃 대신 테스트가 만든 레이아웃으로 `zellij -s cmuxt<pid> -n`을 직접 실행한다(시작 마크를 남겨 `t_zj_gate` 규칙 유지).
 
 ## 발견 (현행 bin/cmux + zellij 0.45.1, 2026-10-01 실측)
 - `cmux kill`은 세션을 실제로 죽이고도 "세션이 없거나 이미 종료됨"을 출력한다. 활성 세션에 `zellij delete-session --force`를 실행하면 세션은 종료되지만 rc=2("Session not found")가 나오고, 폴백인 `kill-session`도 rc=1이라 else 분기로 빠진다. cmux 자체의 종료코드는 0이다. `-k`는 `|| true`로 받기 때문에 겉으로 드러나지 않는다.

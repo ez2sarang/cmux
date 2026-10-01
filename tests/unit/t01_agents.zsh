@@ -35,7 +35,8 @@ source "$CMUX_UNDER_TEST"
 t_assert_eq "주요 함수 로드" "function function function function function function function" \
   "$(whence -w _launch_agent _agent_call _agent_known _ag_claude_has_history _tabs_load _tabs_append _tabs_sync_live | awk '{print $2}' | xargs)"
 t_assert_eq "어댑터 = 대상 cmux 옆 cmux-agents.zsh" "${CMUX_UNDER_TEST:h}/cmux-agents.zsh" "$CMUX_AGENTS_LIB"
-t_assert_eq "등록 에이전트 = claude" "claude" "${CMUX_AGENTS[*]}"
+# P2-A: 등록 에이전트 확장 (claude → claude codex opencode)
+t_assert_eq "등록 에이전트 = claude" "claude codex opencode" "${CMUX_AGENTS[*]}"
 t_assert_eq "CLAUDE_BIN = CMUX_CLAUDE_BIN" "$CMUX_CLAUDE_BIN" "$CLAUDE_BIN"
 t_assert_eq "홈에 파일 생성 없음" "" "$(ls -A "$HOME")"
 t_assert_true "탭 기록 디렉토리 생성 없음" '[[ ! -e "$U_TMP/cfg" ]]'
