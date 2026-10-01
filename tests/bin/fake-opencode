@@ -1,0 +1,19 @@
+#!/bin/sh
+# fake-opencode — 실데이터 리허설(tests/e2e) 전용 가짜 opencode
+# 세션 목록 조회만 실제 opencode(FAKE_OPENCODE_REAL_BIN)에 넘긴다 — 인자가 정확히
+#   '--pure session list --format json -n <숫자>'(cmux opencode 어댑터가 쓰는 읽기 전용 조회)일 때만.
+#   기록 첫 칸은 "fake-opencode-list". 다른 인자의 조회이거나 실제 실행 파일이 없으면 위임하지 않고 exit 1.
+# 그 밖의 호출(에이전트 실행)은 fake-agent처럼 FAKE_AGENT_LOG에 "fake-opencode<TAB>$PWD<TAB>인자들" 한 줄을 남기고 sleep.
+log="${FAKE_AGENT_LOG:-/tmp/fake-agent.log}"
+if [ "$1 $2 $3" = "--pure session list" ]; then
+  printf 'fake-opencode-list\t%s\t%s\n' "$PWD" "$*" >> "$log"
+  case "$#|$4 $5|$6|$7" in
+    "7|--format json|-n|"*[!0-9]*|"7|--format json|-n|") exit 1 ;;
+    "7|--format json|-n|"*)
+      [ -n "$FAKE_OPENCODE_REAL_BIN" ] && [ -x "$FAKE_OPENCODE_REAL_BIN" ] && exec "$FAKE_OPENCODE_REAL_BIN" "$@"
+      ;;
+  esac
+  exit 1
+fi
+printf 'fake-opencode\t%s\t%s\n' "$PWD" "$*" >> "$log"
+exec sleep "${FAKE_AGENT_SLEEP:-3600}"

@@ -62,6 +62,11 @@ _path_without_sync() {
 mkdir -p "$U_TMP/CaseProbe"
 [[ -d "$U_TMP/caseprobe" ]] && U_CI=1 || U_CI=0
 rmdir "$U_TMP/CaseProbe"
+# 끊긴 프로세스 확인용 sleep 값은 이 실행만의 고유값(초.<PID>) — 동시에 도는 다른 테스트 실행의
+# 같은 명령줄을 세지 않게. 종료 확인은 상한 있는 폴링(t_assert_true … 3초)으로 한다
+U_LIST_SLEEP="30.$$" U_SYNC_SLEEP="5.$$"
+# _sleep_procs <초 값> — 명령줄이 정확히 "sleep <값>"인 프로세스 수
+_sleep_procs() { ps -axo command= | grep -cxF "sleep $1"; }
 NOW=$EPOCHSECONDS
 SAFE="-a never -s workspace-write"
 BYPASS="--dangerously-bypass-approvals-and-sandbox"
@@ -264,11 +269,11 @@ t_assert_eq "python3 없음 → last_activity 0" 0 "$(PATH="$U_TMP/emptybin" _ol
 t_assert_eq "opencode 실행 파일 없음 → 없음" "1|||0" "$(CMUX_OPENCODE_BIN="$U_TMP/emptybin/nope" _ohh "$OC/a")"
 # 시간 초과: 조회가 끝나지 않으면 8초에 끊고 없음 (조회 프로세스도 종료)
 t0=$EPOCHREALTIME
-res="$(FAKE_OPENCODE_LIST_SLEEP=30.4242 _ohh "$OC/a")"
+res="$(FAKE_OPENCODE_LIST_SLEEP=$U_LIST_SLEEP _ohh "$OC/a")"
 el=$(( EPOCHREALTIME - t0 ))
 t_assert_eq "시간 초과 → 없음" "1|||0" "$res"
 t_assert_true "시간 초과 → 8초 근처에서 끊음 (실측 ${el%.*}초)" '(( el >= 7.5 && el < 11 ))'
-t_assert_eq "시간 초과 → 조회 프로세스 종료" 0 "$(ps -axo command= | grep -c '^sleep 30.4242$')"
+t_assert_true "시간 초과 → 조회 프로세스 종료" '(( $(_sleep_procs $U_LIST_SLEEP) == 0 ))' 3
 
 # ── A6 ────────────────────────────────────────────────
 t_scenario A6 "codex last_activity·has_history — rollout session_meta"
@@ -485,11 +490,11 @@ t_assert_eq "exit 2 → 경고 1줄 + rc 0" 2 "${#${(f)out}}"
 out="$(FAKE_SYNC_RC=3 _sync "$SY/with")"
 t_assert_contains "exit 3 → 경고 1줄" "$out" "AGENTS.md가 심볼릭 링크라 collar 블록을 갱신하지 않았습니다 (collar-agents-sync exit 3)"
 t0=$EPOCHREALTIME
-out="$(FAKE_SYNC_SLEEP=5.4242 _sync "$SY/with")"
+out="$(FAKE_SYNC_SLEEP=$U_SYNC_SLEEP _sync "$SY/with")"
 el=$(( EPOCHREALTIME - t0 ))
 t_assert_eq "5초 걸리는 sync → 조용히 통과" "rc=0" "$out"
 t_assert_true "타임박스 2초(+α) 뒤 진행 (실측 ${el:0:4}초)" '(( el >= 1.9 && el < 3.5 ))'
-t_assert_eq "타임박스 → sync 프로세스 종료" 0 "$(ps -axo command= | grep -c '^sleep 5.4242$')"
+t_assert_true "타임박스 → sync 프로세스 종료" '(( $(_sleep_procs $U_SYNC_SLEEP) == 0 ))' 3
 
 # ── A11 ───────────────────────────────────────────────
 t_scenario A11 "_launch_agent — 인자 · 배너 · 마커 · fastfail · sync"

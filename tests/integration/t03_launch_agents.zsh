@@ -222,9 +222,11 @@ t_assert_eq "claude → sync 호출 없음" "" "$(cat "$FAKE_SYNC_LOG")"
 _launch_pty "$S" codex
 t_assert_eq "codex → sync 1회, 인자·cwd = 프로젝트 폴더" "$S|$S" "$(cat "$FAKE_SYNC_LOG")"
 t_assert_eq "codex 인자 (sync 뒤 정상 실행)" "resume --last $SAFE" "$(_last_args codex "$S")"
-FAKE_SYNC_SLEEP=5.4242 _launch_pty "$S" opencode
+# sleep 값은 이 실행만의 고유값(5.<PID>) — 동시에 도는 다른 테스트 실행의 같은 명령줄을 세지 않게, 종료 확인은 폴링(3초)
+SYNC_SLEEP="5.$$"
+FAKE_SYNC_SLEEP=$SYNC_SLEEP _launch_pty "$S" opencode
 t_assert_true "5초 걸리는 sync → 2초 타임박스 뒤 실행 (실측 ${LP_ELAPSED:0:4}초)" '(( LP_ELAPSED >= 1.9 && LP_ELAPSED < 4.5 ))'
-t_assert_eq "타임박스 → sync 프로세스 종료" 0 "$(ps -axo command= | grep -c '^sleep 5.4242$')"
+t_assert_true "타임박스 → sync 프로세스 종료" '(( $(ps -axo command= | grep -cxF "sleep $SYNC_SLEEP") == 0 ))' 3
 t_assert_eq "타임박스 → 에이전트는 정상 실행" "" "$(_last_args opencode "$S")"
 t_assert_not_contains "타임박스 → 경고 없음" "$(cat "$T_LAST_LOG")" "collar-agents-sync"
 FAKE_SYNC_RC=2 _launch_pty "$S" codex
