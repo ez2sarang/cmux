@@ -3,21 +3,30 @@
 #
 # 사용법:
 #   cmux                 세션 연결 / 이전 탭 복원 / 프로젝트 선택
-#   cmux <경로>          경로 직접 열기
+#   cmux <경로>          경로 직접 열기 (기본 에이전트)
+#   cmux -a <에이전트> [경로]  에이전트를 골라 열기 (경로 생략 시 현재 폴더)
+#   cmux default [에이전트]    기본 에이전트 조회 / 설정
 #   cmux pick            기록 무시하고 프로젝트 선택기 실행
 #   cmux add [경로]      추가 경로 등록 (DEV_ROOT 외 경로용)
 #   cmux rm              등록 경로 제거
 #   cmux list            프로젝트 목록
 #   cmux -l              zellij 세션 목록
-#   cmux -k              세션 재시작 (같은 탭 복원 + Claude 대화 이어서)
+#   cmux -k              세션 재시작 (같은 탭 복원 + 에이전트 대화 이어서)
 #   cmux kill            세션 종료만 (탭 기록 보존)
 #   cmux -h              도움말
 
+# 사용자 설정 — zsh로 source (있을 때만, 오류는 무시). 예: CMUX_DEFAULT_AGENT=codex / CMUX_CODEX_PERM=auto
+# 모든 서브커맨드(pane의 'cmux launch' 포함)가 맨 먼저 읽는다 — zellij 서버 env를 바꾸지 않아도 적용된다.
+CMUX_CONFIG_FILE="${CMUX_CONFIG_FILE:-${HOME}/.config/cmux/config}"
+[[ -f "$CMUX_CONFIG_FILE" && -r "$CMUX_CONFIG_FILE" ]] && { source "$CMUX_CONFIG_FILE" } 2>/dev/null
+
 SESSION_NAME="${CMUX_SESSION:-claude}"
 DEV_ROOT="${CMUX_ROOT:-${HOME}/Documents/dev/ai}"
-EXTRAS_FILE="${HOME}/.config/cmux/projects"
-# 세션에 열려 있던 탭(프로젝트 경로) 기록 — 재시작·크래시 후 복원용
+EXTRAS_FILE="${CMUX_EXTRAS_FILE:-${HOME}/.config/cmux/projects}"
+# 세션에 열려 있던 탭 기록 — 재시작·크래시 후 복원용. 줄마다 `경로`(claude) 또는 `경로<TAB>에이전트`
 TABS_FILE="${CMUX_TABS_FILE:-${HOME}/.config/cmux/session-tabs}"
+# 프로젝트별 마지막 사용 에이전트(`실제경로<TAB>에이전트`) — picker 사전선택 전용 ('cmux <경로>'엔 적용 안 함)
+PROJECT_AGENTS_FILE="${CMUX_PROJECT_AGENTS_FILE:-${HOME}/.config/cmux/project-agents}"
 # 자기 자신의 절대 경로 (zellij pane 명령으로 사용)
 CMUX_SELF="${0:A}"
 
@@ -99,37 +108,180 @@ _session_alive() {
   return 0
 }
 
+# ── 탭 spec ───────────────────────────────────────────
+# 탭 하나 = spec: `경로` 또는 `경로<TAB>에이전트` (TAB 없음 = claude). 받는 쪽은 항상 _spec_parse로 해석한다.
+# 정규형(기록 줄) = claude는 `경로`만, 그 외 `경로<TAB>에이전트` — 구버전 cmux 호환 (설계 §4)
+# _spec_parse <spec> → reply=(경로 에이전트)
+_spec_parse() {
+  if [[ "$1" == *$'\t'* ]]; then
+    reply=("${1%$'\t'*}" "${${1##*$'\t'}:-claude}")
+  else
+    reply=("$1" claude)
+  fi
+}
+
+# _tab_name <경로> [에이전트] → REPLY = 탭 이름. claude는 basename(현행 그대로), 그 외는 basename·에이전트
+_tab_name() {
+  if [[ "${2:-claude}" == claude ]]; then
+    REPLY="${1:t}"
+  else
+    REPLY="${1:t}·$2"
+  fi
+}
+
+# ── 기본 에이전트 ─────────────────────────────────────
+# _default_agent → REPLY (출처 → _cmux_default_src). env CMUX_AGENT > 설정 CMUX_DEFAULT_AGENT > claude.
+# 등록되지 않은 값은 경고 1줄(stderr, 프로세스당 1회) 후 claude.
+_default_agent() {
+  if [[ -z "$_cmux_default_agent" ]]; then
+    local a src
+    if [[ -n "$CMUX_AGENT" ]]; then
+      a="$CMUX_AGENT" src="환경변수 CMUX_AGENT"
+    elif [[ -n "$CMUX_DEFAULT_AGENT" ]]; then
+      a="$CMUX_DEFAULT_AGENT" src="설정 CMUX_DEFAULT_AGENT — $CMUX_CONFIG_FILE"
+    else
+      a=claude src="기본값"
+    fi
+    if ! _agent_known "$a"; then
+      _warn "기본 에이전트 '${a}'(${src%% — *})는 등록되지 않았습니다 — claude를 씁니다 (사용 가능: ${CMUX_AGENTS[*]})" >&2
+      a=claude src="기본값"
+    fi
+    typeset -g _cmux_default_agent="$a" _cmux_default_src="$src"
+  fi
+  REPLY="$_cmux_default_agent"
+}
+
+# _config_set_default <에이전트> — 설정 파일의 CMUX_DEFAULT_AGENT= 줄을 바꾼다(없으면 추가, 다른 줄 보존).
+# 파일·디렉토리가 없으면 만든다. 원자적(같은 디렉토리 tmp → mv). 실패하면 비0.
+_config_set_default() {
+  local f="${CMUX_CONFIG_FILE:A}"
+  local tmp="${f}.tmp.$$"
+  mkdir -p "${f:h}" 2>/dev/null
+  [[ -d "${f:h}" && -w "${f:h}" ]] || return 1
+  {
+    if [[ -f "$f" ]]; then
+      awk -v line="CMUX_DEFAULT_AGENT=$1" '
+        /^[[:space:]]*(export[[:space:]]+)?CMUX_DEFAULT_AGENT=/ { if (!done) print line; done = 1; next }
+        { print }
+        END { if (!done) print line }' "$f"
+    else
+      print -r -- "CMUX_DEFAULT_AGENT=$1"
+    fi
+  } > "$tmp" && mv -f -- "$tmp" "$f" && return 0
+  rm -f -- "$tmp"
+  return 1
+}
+
+# _agent_remember <spec...> — 마지막 사용 에이전트 기억 (설계 D5 — picker 사전선택 전용)
+# PROJECT_AGENTS_FILE에 `실제경로<TAB>에이전트`. 같은 경로 줄은 교체(중복 줄은 하나로), 나머지 줄 보존,
+# 원자적(tmp → mv). 파일·디렉토리가 없으면 만들고, 실패해도 조용히 넘어간다(탭 열기는 계속) — 항상 0.
+_agent_remember() {
+  local f="$PROJECT_AGENTS_FILE" s p line
+  local -A want
+  local -a order
+  for s in "$@"; do
+    [[ -z "$s" ]] && continue
+    _spec_parse "$s"
+    p="${reply[1]:A}"
+    (( ${+want[$p]} )) || order+=("$p")
+    want[$p]="${reply[2]}"
+  done
+  (( ${#order} )) || return 0
+  mkdir -p "${f:h}" 2>/dev/null
+  [[ -d "${f:h}" && -w "${f:h}" ]] || return 0
+  local tmp="${f}.tmp.$$"
+  {
+    if [[ -f "$f" ]]; then
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        p="${line%%$'\t'*}"
+        if [[ -n "$p" ]] && (( ${+want[$p]} )); then
+          if [[ -n "${want[$p]}" ]]; then print -r -- "$p"$'\t'"${want[$p]}"; fi
+          want[$p]=""    # 교체 완료 — 같은 경로의 다음 줄은 버린다
+          continue
+        fi
+        print -r -- "$line"
+      done < "$f"
+    fi
+    for p in "${order[@]}"; do
+      if [[ -n "${want[$p]}" ]]; then print -r -- "$p"$'\t'"${want[$p]}"; fi
+    done
+  } > "$tmp" 2>/dev/null && mv -f -- "$tmp" "$f" 2>/dev/null
+  rm -f -- "$tmp" 2>/dev/null
+  return 0
+}
+
 # ── 탭 구성 기록 ──────────────────────────────────────
-# 기록된 경로 중 실제로 존재하는 것만 순서대로 출력
+# 기록된 탭 중 경로가 실제로 존재하는 것만 순서대로, 정규형 spec(claude `경로` / 그 외 `경로<TAB>에이전트`)으로 출력.
+# 같은 spec은 처음 것만(손으로 쓴 `경로<TAB>claude`도 `경로`). TAB 뒤가 등록된 에이전트가 아니면
+# 줄 전체를 경로로 본다(대개 없는 경로라 건너뜀).
 _tabs_load() {
   [[ -f "$TABS_FILE" ]] || return 0
-  local p
-  while IFS= read -r p; do
-    [[ -z "$p" ]] && continue
+  local line p a
+  local -aU out
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    p="$line" a=claude
+    if [[ "$line" == *$'\t'* ]] && _agent_known "${line##*$'\t'}"; then
+      p="${line%$'\t'*}" a="${line##*$'\t'}"
+    fi
     [[ -d "$p" ]] || continue
-    echo "$p"
+    _tabs_line "$p"$'\t'"$a"
+    out+=("$REPLY")
   done < "$TABS_FILE"
+  (( ${#out} )) && print -rl -- "${out[@]}"
+  return 0
 }
 
-# 기록 전체 덮어쓰기
+# _tabs_line <spec> → REPLY = 기록 줄 (claude는 `경로`만, 그 외 `경로<TAB>에이전트`)
+_tabs_line() {
+  _spec_parse "$1"
+  if [[ "${reply[2]}" == claude ]]; then
+    REPLY="${reply[1]}"
+  else
+    REPLY="${reply[1]}"$'\t'"${reply[2]}"
+  fi
+}
+
+# _tabs_backup <기록 줄...> — 비-claude 줄(TAB)을 처음 쓰기 직전, 기존 기록(아직 TAB 줄 없음 = 구포맷)을
+# session-tabs.bak-<YYYYMMDD>로 1회 보존한다. 그날 백업이 이미 있으면 건너뛴다.
+_tabs_backup() {
+  [[ "${(j::)@}" == *$'\t'* && -s "$TABS_FILE" ]] || return 0
+  grep -q $'\t' "$TABS_FILE" 2>/dev/null && return 0
+  local day
+  strftime -s day '%Y%m%d' $EPOCHSECONDS
+  [[ -e "${TABS_FILE}.bak-$day" ]] || cp -p -- "$TABS_FILE" "${TABS_FILE}.bak-$day" 2>/dev/null
+  return 0
+}
+
+# 기록 전체 덮어쓰기 (spec 인자들, 순서 유지 — 같은 spec은 처음 것만)
 _tabs_save() {
   mkdir -p "$(dirname "$TABS_FILE")"
-  : > "$TABS_FILE"
-  local d
-  for d in "$@"; do
-    [[ -z "$d" ]] && continue
-    echo "$d" >> "$TABS_FILE"
+  local s
+  local -aU lines
+  for s in "$@"; do
+    [[ -z "$s" ]] && continue
+    _tabs_line "$s"
+    lines+=("$REPLY")
   done
+  _tabs_backup "${lines[@]}"
+  : > "$TABS_FILE"
+  (( ${#lines} )) && print -rl -- "${lines[@]}" >> "$TABS_FILE"
+  return 0
 }
 
-# 없는 항목만 뒤에 추가 (순서 유지, 중복 제거)
+# 없는 spec만 뒤에 추가 (순서 유지, 중복 제거 — 같은 경로라도 에이전트가 다르면 별개)
 _tabs_append() {
   mkdir -p "$(dirname "$TABS_FILE")"
   touch "$TABS_FILE"
-  local d
-  for d in "$@"; do
-    [[ -z "$d" ]] && continue
-    grep -qxF "$d" "$TABS_FILE" 2>/dev/null || echo "$d" >> "$TABS_FILE"
+  local s
+  for s in "$@"; do
+    [[ -z "$s" ]] && continue
+    _tabs_line "$s"
+    grep -qxF -- "$REPLY" "$TABS_FILE" 2>/dev/null && continue
+    # claude는 손으로 쓴 `경로<TAB>claude` 줄도 같은 spec
+    [[ "${reply[2]}" == claude ]] && grep -qxF -- "${reply[1]}"$'\t'claude "$TABS_FILE" 2>/dev/null && continue
+    _tabs_backup "$REPLY"
+    print -r -- "$REPLY" >> "$TABS_FILE"
   done
 }
 
@@ -145,27 +297,45 @@ _tabs_sync_live() {
   fi
   [[ $? -ne 0 || -z "$names" ]] && return 0
 
-  # 후보: 기존 기록(우선) + 프로젝트 목록. 탭 이름(basename)으로 경로를 역추적한다.
-  local -a recorded candidates dirs
-  recorded=("${(@f)$(_tabs_load)}")
-  recorded=("${(@)recorded:#}")
-  candidates=("${recorded[@]}" "${(@f)$(_project_list)}")
-  candidates=("${(@)candidates:#}")
-  dirs=()
+  # 후보: 기존 기록(우선) + 프로젝트 목록. 탭 이름(basename[·에이전트])으로 경로를 역추적한다.
+  # 비교는 `경로<TAB>에이전트`로 펼친 형태로 한다.
+  local -a recorded projects specs
+  local n base agent c hit unmapped=0
+  recorded=()
+  for c in "${(@f)$(_tabs_load)}"; do
+    [[ -z "$c" ]] && continue
+    _spec_parse "$c"
+    recorded+=("${reply[1]}"$'\t'"${reply[2]}")
+  done
+  projects=("${(@f)$(_project_list)}")
+  projects=("${(@)projects:#}")
+  specs=()
 
-  local n c hit unmapped=0
   while IFS= read -r n; do
     [[ -z "$n" ]] && continue
+    # 마지막 '·' 뒤가 등록된 에이전트일 때만 분리 — 아니면 이름 전체가 basename(claude 탭)
+    base="$n" agent=claude
+    if [[ "$n" == *·* ]] && _agent_known "${n##*·}"; then
+      base="${n%·*}" agent="${n##*·}"
+    fi
     hit=""
-    for c in "${candidates[@]}"; do
-      [[ "${c:t}" == "$n" ]] || continue
-      # 이미 다른 탭에 배정된 경로는 제외 — 같은 이름의 프로젝트 2개를 구분
-      (( ${dirs[(Ie)$c]} )) && continue
+    for c in "${recorded[@]}"; do
+      [[ "${c##*$'\t'}" == "$agent" && "${${c%$'\t'*}:t}" == "$base" ]] || continue
+      # 이미 다른 탭에 배정된 spec은 제외 — 같은 이름의 프로젝트 2개를 구분
+      (( ${specs[(Ie)$c]} )) && continue
       hit="$c"
       break
     done
+    if [[ -z "$hit" ]]; then
+      for c in "${projects[@]}"; do
+        [[ "${c:t}" == "$base" ]] || continue
+        (( ${specs[(Ie)$c$'\t'$agent]} )) && continue
+        hit="$c"$'\t'"$agent"
+        break
+      done
+    fi
     if [[ -n "$hit" ]]; then
-      dirs+=("$hit")
+      specs+=("$hit")
     else
       (( unmapped++ ))
     fi
@@ -174,12 +344,12 @@ _tabs_sync_live() {
   if (( unmapped > 0 )); then
     # 이름을 바꾼 탭 등 경로를 알 수 없는 탭이 있으면 기존 기록을 버리지 않고 병합
     for c in "${recorded[@]}"; do
-      (( ${dirs[(Ie)$c]} )) || dirs+=("$c")
+      (( ${specs[(Ie)$c]} )) || specs+=("$c")
     done
     _warn "경로를 알 수 없는 탭 ${unmapped}개 — 기존 기록과 병합해 보존합니다" >&2
   fi
 
-  [[ ${#dirs[@]} -gt 0 ]] && _tabs_save "${dirs[@]}"
+  [[ ${#specs[@]} -gt 0 ]] && _tabs_save "${specs[@]}"
   return 0
 }
 
@@ -213,6 +383,34 @@ _run_client() {
 }
 
 # ── KDL 탭 블록 생성 ──────────────────────────────────
+# 탭 본문(에이전트 pane 65% | 파일트리 / 터미널) — 들여쓰기 0. 세션 레이아웃(_kdl_tab)과 new-tab 레이아웃
+# (_kdl_tab_layout)이 같이 쓴다. claude는 기존과 같은 `args "launch"`·pane 이름 claude,
+# 그 외는 `args "launch" "--agent" "<에이전트>"`·pane 이름 = 에이전트.
+_kdl_tab_body() {
+  local agent="${1:-claude}"
+  local escaped_self="${CMUX_SELF//\\/\\\\}"
+  escaped_self="${escaped_self//\"/\\\"}"
+  local launch_args='"launch"'
+  [[ "$agent" != claude ]] && launch_args+=" \"--agent\" \"${agent}\""
+
+  cat <<KDL
+pane split_direction="vertical" {
+    pane size="65%" focus=true name="${agent}" {
+        command "$escaped_self"
+        args ${launch_args}
+    }
+    pane size="35%" split_direction="horizontal" {
+        pane size="55%" name="files" {
+            command "/bin/zsh"
+            args "-c" "eza --tree --level 2 --icons --color=always . 2>/dev/null || ls -la .; exec zsh -i"
+        }
+        pane size="45%" name="terminal"
+    }
+}
+KDL
+}
+
+# _kdl_tab <경로> <탭 이름> [focus(true|false)] [에이전트(기본 claude)] — 세션 레이아웃의 tab 블록
 _kdl_tab() {
   local dir="$1"
   local name="$2"
@@ -224,38 +422,60 @@ _kdl_tab() {
   local escaped_dir="${dir//\\/\\\\}"
   escaped_dir="${escaped_dir//\"/\\\"}"
   local escaped_name="${name//\"/\\\"}"
-  local escaped_self="${CMUX_SELF//\\/\\\\}"
-  escaped_self="${escaped_self//\"/\\\"}"
+  local -a body=("${(@f)$(_kdl_tab_body "${4:-claude}")}")
 
-  local bar_line=""
+  print -r -- "    tab name=\"$escaped_name\" cwd=\"$escaped_dir\"$focus_attr {"
+  print -rl -- "${(@)body/#/        }"
+  print -r -- "    }"
+}
+
+# _kdl_tab_layout <에이전트> — new-tab 전용 탭 레이아웃 (claude-tab.kdl.tmpl과 같은 구조: 탭바·cmux-bar·본문·상태바).
+# new-tab -l 은 세션 default_tab_template을 적용하지 않으므로 바들을 직접 포함한다. 에이전트 인자만 다르다.
+_kdl_tab_layout() {
+  local bar_block=""
   if [[ -n "$CMUX_BAR_BIN" && -x "$CMUX_BAR_BIN" ]]; then
     # zellij 0.45.1은 1행 터미널 pane을 렌더링하지 않으므로 2행 (내용 1행 + 아래 pane 프레임 행)
-    bar_line="        pane size=2 borderless=true {
-            command \"/bin/zsh\"
-            args \"-c\" \"while true; do ${CMUX_BAR_BIN}; sleep 1; done\"
-        }"
+    bar_block="
+    pane size=2 borderless=true {
+        command \"/bin/zsh\"
+        args \"-c\" \"while true; do ${CMUX_BAR_BIN}; sleep 1; done\"
+    }"
   fi
+  local -a body=("${(@f)$(_kdl_tab_body "${1:-claude}")}")
 
   cat <<KDL
-    tab name="$escaped_name" cwd="$escaped_dir"$focus_attr {
-        pane split_direction="vertical" {
-            pane size="65%" focus=true name="claude" {
-                command "$escaped_self"
-                args "launch"
-            }
-            pane size="35%" split_direction="horizontal" {
-                pane size="55%" name="files" {
-                    command "/bin/zsh"
-                    args "-c" "eza --tree --level 2 --icons --color=always . 2>/dev/null || ls -la .; exec zsh -i"
-                }
-                pane size="45%" name="terminal"
-            }
-        }
+layout {
+    pane size=1 borderless=true {
+        plugin location="zellij:tab-bar"
+    }${bar_block}
+${(F)${(@)body/#/    }}
+    pane size=2 borderless=true {
+        plugin location="zellij:status-bar"
     }
+}
 KDL
 }
 
-# 세션 레이아웃 파일 생성
+# _tab_layout <에이전트> → REPLY = new-tab -l 에 줄 레이아웃 이름 (--layout-dir ZELLIJ_LAYOUTS_DIR).
+# claude는 설치된 claude-tab, 그 외는 cmux-tab-<에이전트>.kdl을 매번 생성(원자적 tmp → mv)해 쓴다. 생성 실패면 비0.
+_tab_layout() {
+  local agent="${1:-claude}"
+  if [[ "$agent" == claude ]]; then
+    REPLY="claude-tab"
+    return 0
+  fi
+  REPLY="cmux-tab-${agent}"
+  local f="${ZELLIJ_LAYOUTS_DIR}/${REPLY}.kdl"
+  mkdir -p "$ZELLIJ_LAYOUTS_DIR" 2>/dev/null
+  if _kdl_tab_layout "$agent" 2>/dev/null > "$f.tmp.$$" && mv -f -- "$f.tmp.$$" "$f" 2>/dev/null; then
+    return 0
+  fi
+  rm -f -- "$f.tmp.$$" 2>/dev/null
+  _warn "탭 레이아웃을 만들지 못했습니다: $f" >&2
+  return 1
+}
+
+# 세션 레이아웃 파일 생성 (spec 인자들)
 _make_layout() {
   local tmpfile="$SESSION_LAYOUT_FILE"
   mkdir -p "$ZELLIJ_LAYOUTS_DIR"
@@ -283,15 +503,19 @@ ${bar_block}
     }
 HEADER
 
-  # 포커스 탭: LAYOUT_FOCUS_DIR 이 지정되면 그 탭, 아니면 첫 탭
-  local focus_dir="${LAYOUT_FOCUS_DIR:-$1}"
-  local dir name
-  for dir in "$@"; do
-    name="${dir:t}"
-    if [[ "$dir" == "$focus_dir" ]]; then
-      _kdl_tab "$dir" "$name" "true" >> "$tmpfile"
+  # 포커스 탭: LAYOUT_FOCUS_SPEC 이 지정되면 그 탭, 아니면 첫 탭
+  _spec_parse "${LAYOUT_FOCUS_SPEC:-$1}"
+  local focus_spec="${reply[1]}"$'\t'"${reply[2]}"
+  local spec dir agent name
+  for spec in "$@"; do
+    _spec_parse "$spec"
+    dir="${reply[1]}" agent="${reply[2]}"
+    _tab_name "$dir" "$agent"
+    name="$REPLY"
+    if [[ "$dir"$'\t'"$agent" == "$focus_spec" ]]; then
+      _kdl_tab "$dir" "$name" "true" "$agent" >> "$tmpfile"
     else
-      _kdl_tab "$dir" "$name" "false" >> "$tmpfile"
+      _kdl_tab "$dir" "$name" "false" "$agent" >> "$tmpfile"
     fi
   done
   echo "}" >> "$tmpfile"
@@ -307,7 +531,7 @@ _client_attached() {
 # ("Not enough room for panes") 다음 attach 때 그 탭을 버린다 — CLI는 성공 코드를 돌려준다.
 # → 먼저 attach하고, 클라이언트가 붙은 것을 확인한 뒤 백그라운드에서 탭을 추가한다.
 _attach_then_add_tabs() {
-  local -a dirs=("$@")
+  local -a specs=("$@")
   (
     local i=0
     while (( i < 50 )) && ! _client_attached; do
@@ -317,15 +541,20 @@ _attach_then_add_tabs() {
     # 클라이언트가 끝내 붙지 않았으면(attach 실패) 탭을 만들지도 기록하지도 않는다
     _client_attached || exit 0
     sleep 0.3
-    local first_name="" dir name
-    for dir in "${dirs[@]}"; do
-      name="${dir:t}"
+    local first_name="" spec dir agent name
+    for spec in "${specs[@]}"; do
+      _spec_parse "$spec"
+      dir="${reply[1]}" agent="${reply[2]}"
+      _tab_name "$dir" "$agent"
+      name="$REPLY"
+      _tab_layout "$agent" || continue
       zellij -s "$SESSION_NAME" action new-tab \
-        -l "claude-tab" \
+        -l "$REPLY" \
         --layout-dir "$ZELLIJ_LAYOUTS_DIR" \
         -n "$name" \
         -c "$dir" \
-      && _tabs_append "$dir" \
+      && _tabs_append "$spec" \
+      && _agent_remember "$spec" \
       && [[ -z "$first_name" ]] && first_name="$name"
     done
     sleep 0.3
@@ -335,9 +564,13 @@ _attach_then_add_tabs() {
 }
 
 # ── 프로젝트 열기 (단일) ──────────────────────────────
+# _open_one <spec> [탭 이름]
 _open_one() {
-  local dir="$1"
-  local name="${2:-$(basename "$dir")}"
+  _spec_parse "$1"
+  local dir="${reply[1]}" agent="${reply[2]}"
+  local spec="$dir"$'\t'"$agent"
+  _tab_name "$dir" "$agent"
+  local name="${2:-$REPLY}"
 
   if [[ ! -d "$dir" ]]; then
     _warn "디렉토리가 없습니다: $dir" >&2
@@ -347,53 +580,65 @@ _open_one() {
   _info "프로젝트 열기: $name"
 
   if [[ -n "$ZELLIJ" ]]; then
-    zellij action new-tab \
-      -l "claude-tab" \
-      --layout-dir "$ZELLIJ_LAYOUTS_DIR" \
-      -n "$name" \
-      -c "$dir" \
-    && _tabs_append "$dir"
+    if _tab_layout "$agent"; then
+      zellij action new-tab \
+        -l "$REPLY" \
+        --layout-dir "$ZELLIJ_LAYOUTS_DIR" \
+        -n "$name" \
+        -c "$dir" \
+      && _tabs_append "$spec" \
+      && _agent_remember "$spec"
+    fi
     sleep 0.5
     zellij action go-to-tab-name "$name"
     sleep 0.3
   elif _session_alive; then
     # 살아 있는 세션은 절대 죽이지 않는다 — 연결한 뒤 탭 추가
-    _attach_then_add_tabs "$dir"
+    _attach_then_add_tabs "$spec"
   else
     # 세션이 죽은 상태에서 경로를 직접 열면 이전 탭 기록을 버리지 않고 함께 복원
     # (picker로 고른 새 구성은 CMUX_FRESH=1 이라 기록을 대체)
-    local -a dirs=()
+    local -a specs=()
     if [[ -z "$CMUX_FRESH" ]]; then
-      dirs=("${(@f)$(_tabs_load)}")
-      dirs=("${(@)dirs:#}")
-      dirs=("${(@)dirs:#$dir}")
+      _tabs_line "$spec"   # _tabs_load와 같은 정규형으로 비교
+      specs=("${(@f)$(_tabs_load)}")
+      specs=("${(@)specs:#}")
+      specs=("${(@)specs:#$REPLY}")
     fi
-    if [[ ${#dirs[@]} -gt 0 ]]; then
-      _info "이전 세션 탭 ${#dirs[@]}개도 함께 복원 — 새 구성으로 시작하려면 'cmux pick'"
+    if [[ ${#specs[@]} -gt 0 ]]; then
+      _info "이전 세션 탭 ${#specs[@]}개도 함께 복원 — 새 구성으로 시작하려면 'cmux pick'"
     fi
-    dirs+=("$dir")
-    _tabs_save "${dirs[@]}"
+    specs+=("$spec")
+    _tabs_save "${specs[@]}"
+    _agent_remember "${specs[@]}"
     cd "$dir"
-    LAYOUT_FOCUS_DIR="$dir" _make_layout "${dirs[@]}"
+    LAYOUT_FOCUS_SPEC="$spec" _make_layout "${specs[@]}"
     _run_client -s "$SESSION_NAME" -n "$SESSION_LAYOUT_FILE"
   fi
 }
 
 # ── 프로젝트 열기 (다중) ─────────────────────────────
+# _open_many <spec...>
 _open_many() {
-  local -a dirs=("$@")
+  local -a specs=("$@")
+  local spec dir agent name
 
   if [[ -n "$ZELLIJ" ]]; then
-    local first_name="" dir name
-    for dir in "${dirs[@]}"; do
-      name="${dir:t}"
+    local first_name=""
+    for spec in "${specs[@]}"; do
+      _spec_parse "$spec"
+      dir="${reply[1]}" agent="${reply[2]}"
+      _tab_name "$dir" "$agent"
+      name="$REPLY"
       _info "탭 추가: $name"
+      _tab_layout "$agent" || continue
       zellij action new-tab \
-        -l "claude-tab" \
+        -l "$REPLY" \
         --layout-dir "$ZELLIJ_LAYOUTS_DIR" \
         -n "$name" \
         -c "$dir" \
-      && _tabs_append "$dir" \
+      && _tabs_append "$spec" \
+      && _agent_remember "$spec" \
       && [[ -z "$first_name" ]] && first_name="$name"
     done
     sleep 0.5
@@ -401,15 +646,17 @@ _open_many() {
     sleep 0.3
   elif _session_alive; then
     # 살아 있는 세션은 절대 죽이지 않는다 — 연결한 뒤 탭 추가
-    local dir
-    for dir in "${dirs[@]}"; do
-      _info "탭 추가: ${dir:t}"
+    for spec in "${specs[@]}"; do
+      _spec_parse "$spec"
+      _tab_name "${reply[1]}" "${reply[2]}"
+      _info "탭 추가: $REPLY"
     done
-    _attach_then_add_tabs "${dirs[@]}"
+    _attach_then_add_tabs "${specs[@]}"
   else
-    _info "프로젝트 ${#dirs[@]}개 탭 생성 중..."
-    _tabs_save "${dirs[@]}"
-    _make_layout "${dirs[@]}"
+    _info "프로젝트 ${#specs[@]}개 탭 생성 중..."
+    _tabs_save "${specs[@]}"
+    _agent_remember "${specs[@]}"
+    _make_layout "${specs[@]}"
     _run_client -s "$SESSION_NAME" -n "$SESSION_LAYOUT_FILE"
   fi
 }
@@ -422,7 +669,7 @@ _restore_tabs() {
 
   [[ ${#restore[@]} -eq 0 ]] && return 1
 
-  _info "이전 세션 복원: ${#restore[@]}개 탭 (Claude 대화 이어서) — 다른 구성을 고르려면 'cmux pick'"
+  _info "이전 세션 복원: ${#restore[@]}개 탭 (에이전트 대화 이어서) — 다른 구성을 고르려면 'cmux pick'"
   if [[ ${#restore[@]} -eq 1 ]]; then
     _open_one "${restore[1]}"
   else
@@ -432,9 +679,25 @@ _restore_tabs() {
 }
 
 # ── 프로젝트 피커 ──────────────────────────────────────
+# picker 출력: 줄마다 `경로`(= default 에이전트) 또는 `경로<TAB>에이전트`.
+# picker에 넘기는 env — CMUX_PICKER_AGENTS: 등록 에이전트 중 실행 파일이 실제로 있는 것(default는 항상, 등록 순서),
+# CMUX_PICKER_DEFAULT_AGENT: default, CMUX_PICKER_PREFS_FILE: 마지막 사용 기억(사전선택).
+# fzf 폴백(picker 없음)은 경로만 낸다 → 모두 default 에이전트.
 _pick() {
   if [[ -n "$CMUX_PICKER_BIN" && -x "$CMUX_PICKER_BIN" ]]; then
-    CMUX_ROOT="$DEV_ROOT" "$CMUX_PICKER_BIN"
+    _default_agent
+    local def="$REPLY" a
+    local -a avail=()
+    for a in "${CMUX_AGENTS[@]}"; do
+      if [[ "$a" == "$def" ]] || { _agent_call "$a" bin && command -v -- "$REPLY" >/dev/null 2>&1 }; then
+        avail+=("$a")
+      fi
+    done
+    CMUX_ROOT="$DEV_ROOT" \
+    CMUX_PICKER_AGENTS="${avail[*]}" \
+    CMUX_PICKER_DEFAULT_AGENT="$def" \
+    CMUX_PICKER_PREFS_FILE="$PROJECT_AGENTS_FILE" \
+      "$CMUX_PICKER_BIN"
   else
     _project_list \
       | awk -F'/' '{print $NF "\t" $0}' \
@@ -447,6 +710,10 @@ _pick() {
 
 # 피커 실행 → 선택 결과로 열기
 _pick_flow() {
+  # default 해석(잘못된 값 경고 포함)은 picker 출력 캡처 밖에서 1회
+  _default_agent
+  local def="$REPLY"
+
   # picker 출력과 종료 코드를 분리 캡처 — 실패(exit≠0)와 취소(exit 0)를 구분
   local pick_out pick_status
   pick_out="$(_pick)"
@@ -467,13 +734,21 @@ _pick_flow() {
     exit 0
   fi
 
+  # 줄 = `경로` 또는 `경로<TAB>에이전트` → spec. 경로 검사는 경로 부분만, 등록되지 않은 에이전트는 경고 후 default
   local -a valid=()
-  for d in "${selected[@]}"; do
-    if [[ -d "$d" ]]; then
-      valid+=("$d")
-    else
+  local line d a
+  for line in "${selected[@]}"; do
+    d="$line" a="$def"
+    [[ "$line" == *$'\t'* ]] && d="${line%$'\t'*}" a="${line##*$'\t'}"
+    if [[ ! -d "$d" ]]; then
       _warn "경로 없음 (건너뜀): $d"
+      continue
     fi
+    if ! _agent_known "$a"; then
+      _warn "알 수 없는 에이전트 '${a}' — 기본 에이전트(${def})로 엽니다: ${d:t}"
+      a="$def"
+    fi
+    valid+=("$d"$'\t'"$a")
   done
 
   if [[ ${#valid[@]} -eq 0 ]]; then
@@ -612,11 +887,53 @@ case "$1" in
     echo "  cmux -k            세션 재시작 — 같은 탭 복원 + 각 탭 Claude 대화 이어서 (세션 안/밖 모두)"
     echo "  cmux kill          세션 종료만 (탭 기록은 보존 — 다음 'cmux'가 복원)"
     echo "  cmux launch [경로] (내부용) Claude Code 실행 — 대화 기록 있으면 --continue"
+    echo "  cmux launch [경로] --agent <에이전트>  (내부용) 그 에이전트 실행 — 이전 대화 있으면 이어서"
+    echo "  cmux -a <에이전트> [경로]  에이전트를 골라 열기 (경로 생략 시 현재 폴더, --agent 동의어)"
+    echo "  cmux default [에이전트]   기본 에이전트 조회 / 설정 (설정 파일의 CMUX_DEFAULT_AGENT)"
     echo ""
+    _default_agent
     echo "DEV_ROOT: $DEV_ROOT  (환경변수 CMUX_ROOT 로 변경)"
     echo "Claude:   $CLAUDE_BIN  (환경변수 CMUX_CLAUDE_BIN 로 변경)"
     echo "탭 기록:  $TABS_FILE  (환경변수 CMUX_TABS_FILE 로 변경)"
+    echo "에이전트: ${CMUX_AGENTS[*]}  — 기본 $REPLY (${_cmux_default_src%% — *}; 환경변수 CMUX_AGENT > 설정 > claude)"
+    echo "설정:     $CMUX_CONFIG_FILE  (zsh로 읽음, 환경변수 CMUX_CONFIG_FILE 로 변경 — 예: CMUX_DEFAULT_AGENT=codex, CMUX_CODEX_PERM=auto)"
+    echo "         'cmux <경로>'·picker 선택 기본 = 기본 에이전트, picker는 프로젝트별 마지막 사용 에이전트를 미리 고른다"
     exit 0
+    ;;
+
+  default)
+    # 기본 에이전트 조회 / 설정 — cmux default [에이전트]
+    if [[ -z "$2" ]]; then
+      _default_agent
+      echo "기본 에이전트: $REPLY  (${_cmux_default_src})"
+      exit 0
+    fi
+    if ! _agent_known "$2"; then
+      _warn "알 수 없는 에이전트: '${2}' (사용 가능: ${CMUX_AGENTS[*]})" >&2
+      exit 1
+    fi
+    if ! _config_set_default "$2"; then
+      _warn "설정 파일을 쓰지 못했습니다: $CMUX_CONFIG_FILE" >&2
+      exit 1
+    fi
+    _ok "기본 에이전트 = $2  (설정: $CMUX_CONFIG_FILE)"
+    [[ -n "$CMUX_AGENT" && "$CMUX_AGENT" != "$2" ]] && _warn "지금은 환경변수 CMUX_AGENT=${CMUX_AGENT} 가 우선합니다"
+    exit 0
+    ;;
+
+  -a|--agent)
+    # 에이전트를 골라 열기 — cmux -a <에이전트> [경로] (경로 생략 시 현재 폴더)
+    if ! _agent_known "$2"; then
+      _warn "알 수 없는 에이전트: '${2}' (사용 가능: ${CMUX_AGENTS[*]}) — 사용법: cmux -a <에이전트> [경로]" >&2
+      exit 1
+    fi
+    local atarget
+    atarget=$(realpath "${3:-$PWD}" 2>/dev/null || echo "${3:-$PWD}")
+    if [[ ! -d "$atarget" ]]; then
+      _warn "디렉토리가 없습니다: $atarget" >&2
+      exit 1
+    fi
+    _open_one "$atarget"$'\t'"$2"
     ;;
 
   launch)
@@ -777,16 +1094,16 @@ case "$1" in
     ;;
 
   *)
-    # cmux PATH — 직접 경로로 열기
+    # cmux PATH — 직접 경로로 열기 (기본 에이전트 — 마지막 사용 기억은 적용하지 않는다, 설계 D5)
     local target
     target=$(realpath "$1" 2>/dev/null || echo "$1")
-    local name="${2:-$(basename "$target")}"
 
     if [[ ! -d "$target" ]]; then
       _warn "디렉토리가 없습니다: $target" >&2
       exit 1
     fi
 
-    _open_one "$target" "$name"
+    _default_agent
+    _open_one "$target"$'\t'"$REPLY" "$2"
     ;;
 esac

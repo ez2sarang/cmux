@@ -37,10 +37,14 @@ claude 외 codex / opencode / gemini(/ aider)를 같은 형태(탭별 자동 시
 - **구현된 `_launch_agent` 순서(P2-A)**: 실행 파일 확인(없으면 사유 + `exec zsh -i`) → 비-claude면 `_collar_agents_sync`(§8) → 권한 프로파일·인자 조립 → `_handoff_marker_consume`(§6, 소비 시 fresh) → 아니면 `has_history` → 배너 1줄(회색 `\e[90m`, stdout = pane 터미널): `▶ <label>: 이전 대화 이어서 시작 [<설명>]` / `▶ <label>: 핸드오프 직후 — 새로 시작` / `▶ <label>: 새로 시작` → 실행(자식) + fastfail(`1≤rc≤128`이고 fastfail초 안이면 fresh 1회). 배너와 마커 소비는 claude에도 동일 적용.
 
 ## 4. 데이터 포맷
-- `session-tabs`: 줄당 `경로` 또는 `경로<TAB>에이전트`. TAB 없음 = claude. `_tabs_load`는 항상 정규화(`경로<TAB>에이전트`) 출력. **`_tabs_save`/`_tabs_append`는 claude 항목을 `경로`만(구포맷과 동일)으로, 비-claude 항목만 `경로<TAB>에이전트`로 기록**한다 — 구버전 cmux로 롤백해도 claude 탭 복원이 깨지지 않게(구버전은 TAB 줄을 `[[ -d ]]` 실패로 조용히 버림 → 비-claude 탭만 빠짐). 비-claude 줄을 처음 쓰기 직전 `session-tabs.bak-<날짜>` 1회. dedupe는 정규화된 spec 단위(같은 경로 + 같은 에이전트만 중복). 설치본·레포본 동시 교체 필수.
-- 탭 이름: claude = `name`(현행 그대로), 그 외 `name·codex`. `_tabs_sync_live`는 마지막 `·` 뒤 토큰이 **등록된 에이전트명일 때만** 분리, 아니면 통째로 이름(사용자가 개명한 탭은 현행대로 unmapped→기록 병합).
+- `session-tabs`: 줄당 `경로` 또는 `경로<TAB>에이전트`. TAB 없음 = claude. **`_tabs_save`/`_tabs_append`는 claude 항목을 `경로`만(구포맷과 동일)으로, 비-claude 항목만 `경로<TAB>에이전트`로 기록**한다 — 구버전 cmux로 롤백해도 claude 탭 복원이 깨지지 않게(구버전은 TAB 줄을 `[[ -d ]]` 실패로 조용히 버림 → 비-claude 탭만 빠짐, 실측 t04_mixed_restore M7·M8). dedupe는 정규화된 spec 단위(같은 경로 + 같은 에이전트만 중복). 설치본·레포본 동시 교체 필수.
+  - **구현(P2-B2)**: `_tabs_load`는 정리된 **정규형 = 기록 줄 형식**(claude `경로` / 그 외 `경로<TAB>에이전트`, 없는 경로·빈 줄 건너뜀, 같은 spec 1번 — 손으로 쓴 `경로<TAB>claude`도 `경로`)을 출력하고, 모든 소비자는 `_spec_parse <spec>`(→ `reply=(경로 에이전트)`)로 해석한다. 처음 설계의 "`경로<TAB>claude`로 정규화 출력"은 기존 특성화 테스트 t02 T1(경로만 출력 고정)과 충돌해 채택하지 않았다. TAB 뒤가 등록 에이전트가 아니면 줄 전체를 경로로 본다(대개 없는 경로라 건너뜀 — 구버전과 대칭).
+  - `.bak`: 비-claude 줄을 쓰기 직전, 기존 파일이 비어 있지 않고 TAB 줄이 없으면(= 아직 구포맷) `session-tabs.bak-<YYYYMMDD>`로 복사. 그날 백업이 이미 있으면 건너뜀(덮어쓰지 않음).
+- 탭 이름: claude = `name`(현행 그대로), 그 외 `name·codex`(`_tab_name <경로> <에이전트>`). `_tabs_sync_live`는 마지막 `·` 뒤 토큰이 **등록된 에이전트명일 때만** 분리, 아니면 통째로 이름(사용자가 개명한 탭은 현행대로 unmapped→기록 병합). 후보 = 기록(같은 basename·같은 에이전트, 우선) → 프로젝트 목록(basename 일치 + 이름의 에이전트), 이미 배정된 spec은 건너뜀.
 - default 에이전트: `~/.config/cmux/config`(zsh source, `CMUX_DEFAULT_AGENT=claude`), env `CMUX_AGENT` 우선, `cmux default [agent]`로 조회·설정.
-- 마지막 사용 기억: `~/.config/cmux/project-agents`(`경로<TAB>에이전트`).
+  - **구현(P2-B2)**: 설정 파일(`CMUX_CONFIG_FILE`, 기본 `~/.config/cmux/config`)은 `bin/cmux` **최상단**에서 모든 서브커맨드(pane의 `cmux launch` 포함)가 있을 때만 source한다(오류·출력 stderr 무시) → `CMUX_CODEX_PERM=auto` 같은 값이 zellij 서버 env를 바꾸지 않아도 pane에 적용된다. 단순 source이므로 **같은 이름의 env 값보다 설정 파일이 이긴다** — 일회성 default 덮어쓰기는 `CMUX_AGENT`. 우선순위 `CMUX_AGENT` > `CMUX_DEFAULT_AGENT` > claude, 미등록 값은 stderr 경고 1줄(프로세스당 1회) 후 claude. `cmux default <a>`는 등록 확인 후 `CMUX_DEFAULT_AGENT=` 줄(앞에 `export` 허용)의 첫 줄을 교체·나머지 같은 키 줄 제거·다른 줄 보존·없으면 끝에 추가, 원자적(같은 디렉토리 tmp→mv), 파일·디렉토리 생성, 심볼릭 링크면 대상 파일을 갱신. `cmux launch`(인자 `--agent` 없음)는 default와 무관하게 **항상 claude** — 설치된 `claude-tab.kdl`/`claude-project.kdl`이 `args "launch"`만 쓰기 때문.
+- 마지막 사용 기억: `~/.config/cmux/project-agents`(`경로<TAB>에이전트`). **구현(P2-B2)**: `CMUX_PROJECT_AGENTS_FILE`. 탭을 실제로 열 때마다(콜드 레이아웃·attach 후 new-tab 성공·세션 안 new-tab 성공, 복원 포함) 기록. 경로 키는 실제 경로(`:A`) — picker가 논리·물리 경로 둘 다 찾는다. 같은 경로 줄은 제자리 교체(중복 줄 제거), 원자적, 실패는 조용히(탭 열기는 계속). `cmux <경로>`에는 적용하지 않는다(D5).
+- 테스트 격리 env(P2-B2 추가): `CMUX_CONFIG_FILE`, `CMUX_PROJECT_AGENTS_FILE`, `CMUX_EXTRAS_FILE`(등록 경로 — 전에는 env로 못 바꿨다).
 - 같은 프로젝트에 서로 다른 에이전트 2개 동시 허용(탭 이름 접미사로 충돌 없음), 같은 에이전트 2개는 금지(중복 제거).
 
 ## 5. 에이전트 어댑터 명세
@@ -99,6 +103,16 @@ claude: `has_history`/`last_activity`는 같은 grep+awk 스캔(`_ag_claude_sess
 - 출력: `경로` 또는 `경로<TAB>에이전트`(비기본만 — 구버전 호환). fzf 폴백은 `cut -f2` 유지.
 - 키(현행 h/j/k/l/방향/Space/Enter/Esc/q와 충돌 없게 `bin/cmux-picker` 확인): `a` = 커서 항목 에이전트 순환(`[codex]` 배지), `Tab` = 이번 선택의 기본 에이전트 순환(타이틀 표시). 사전선택 = `project-agents` 기억 > default.
 - `cmux -a <agent> <경로>`, `cmux default [agent]`. `_open_one/_open_many/_attach_then_add_tabs/_restore_tabs/_kdl_tab/_make_layout`가 spec(경로+에이전트)을 다루도록 일반화. 새 탭 레이아웃은 에이전트 인자를 내장(`args "launch" "--agent" "<a>"`)한 `cmux-tab-<agent>.kdl`을 같은 생성기에서 런타임 생성(`new-tab -l <이름> --layout-dir`). `--layout-string`은 Phase 0 S1 통과 시 대안. 기존 `claude-tab.kdl`/`claude-project.kdl` 설치 유지, 세션명 `claude` 유지, pane `name`만 에이전트명으로, 문구 "Claude 대화 이어서"→"에이전트 대화 이어서". config.kdl `unbind "Ctrl o"` 유지.
+
+**P2-B2 구현 결과 (2026-10-01)**
+| 항목 | 구현 |
+|---|---|
+| 레이아웃 | 탭 본문(에이전트 pane 65% / 파일트리 / 터미널)은 `_kdl_tab_body <a>` 하나 — 세션 레이아웃 `_kdl_tab`(8칸 들여쓰기)과 new-tab 레이아웃 `_kdl_tab_layout <a>`(탭바·cmux-bar·본문·상태바, `claude-tab.kdl.tmpl`과 같은 구조)이 같이 쓴다. claude는 `args "launch"`·pane `name="claude"` 그대로 → claude 전용 세션 레이아웃이 이전 구현(a1a07e9)과 **바이트 동일**, `_kdl_tab_layout claude` = 렌더된 `claude-tab.kdl`(주석·빈 줄 제외) — 단위 t04 S6이 고정. new-tab: claude는 설치된 `claude-tab`, 그 외는 `_tab_layout <a>`가 `ZELLIJ_LAYOUTS_DIR/cmux-tab-<a>.kdl`을 매번 원자적(tmp→mv)으로 다시 써서 `-l cmux-tab-<a> --layout-dir`. 생성 실패면 그 탭만 경고 후 건너뜀 |
+| `cmux -a <a> [경로]` | `--agent` 동의어. 미등록이면 오류+사용 가능 목록 exit 1, 경로 생략 시 `$PWD`(realpath), `_open_one 경로<TAB>a`. `cmux <경로> [이름]`은 default 에이전트(마지막 사용 기억 미적용) |
+| picker 연동 | `_pick`이 `CMUX_PICKER_AGENTS`(등록 순서, 실행 파일이 실제로 있는 것 = `bin` 훅 + `command -v`, default는 항상 포함)·`CMUX_PICKER_DEFAULT_AGENT`·`CMUX_PICKER_PREFS_FILE`(=`PROJECT_AGENTS_FILE`)를 넘긴다. `_pick_flow`는 줄을 `경로[<TAB>에이전트]`로 나눠 경로 부분만 `[[ -d ]]`, 에이전트가 없으면 default, 미등록이면 경고 1줄 후 default. default 해석(잘못된 값 경고)은 picker 출력 캡처 밖에서 1회. fzf 폴백은 경로만 → 전부 default |
+| 복원 안내문 | "이전 세션 복원: N개 탭 (에이전트 대화 이어서)" |
+| 도움말 | `-a`·`default`·`launch --agent` 줄과 에이전트·default 출처·설정 파일 안내 추가(기존 줄 유지, sync/close-tab은 P2-C) |
+| 테스트 | 단위 `t04_tabs_agents`(S1~S10), 통합 `t04_mixed_restore`(M1~M8 + M6b 세션 안 `-a` + M6c 비-claude 탭 닫은 뒤 kill 동기화), `t05_pick_flow`(P1~P4). 롤백 실측: 혼재 기록 → 구버전은 claude 탭만 복원·비-claude 실행 0·기록을 claude 줄만으로 다시 씀(.bak 보존), 새 버전의 claude 전용 기록 → 구버전이 그대로 복원 |
 
 ## 11. 오염 문제 (D2)
 - **실측**: `~/.claude/projects/-Users-ez2sarang-Documents-dev-ai-cmux/`에 `entrypoint=sdk-cli` 37줄 jsonl 2개(13:02, 13:14) — collar-compact(L1023 `"$CLAUDE_BIN" -p …`, cwd=호출 디렉토리)의 요약 호출이 프로젝트 세션 폴더에 요약 세션을 남긴다. collar-compact에 `sdk-cli`/`entrypoint` 필터 0건. 자동 압축(SessionEnd/워치독)이 대화 종료 직후 돌면 요약 세션이 "가장 최신"이 되는 창이 실제로 존재했다(13:01 대화 → 13:02 요약 세션).
