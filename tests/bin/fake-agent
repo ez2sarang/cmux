@@ -1,0 +1,17 @@
+#!/bin/sh
+# fake-agent — 가짜 에이전트 CLI (cmux 테스트 전용, 실제 claude/codex/opencode/gemini 대신 실행)
+# 심볼릭 링크 이름(fake-claude/fake-codex/fake-opencode/fake-gemini)으로 에이전트를 구분한다.
+# FAKE_AGENT_LOG 에 "basename($0)<TAB>$PWD<TAB>인자들(공백 구분)" 한 줄을 남기고 sleep으로 대기한다.
+# FAKE_AGENT_FAIL_ON=<인자>: 그 인자가 있으면 기록 후 곧바로 exit 1 (예: --continue → "No conversation found" 흉내)
+#   FAKE_AGENT_FAIL_SIGNAL=<신호>를 함께 주면 exit 1 대신 그 신호로 스스로 죽는다 (예: KILL → rc 137)
+log="${FAKE_AGENT_LOG:-/tmp/fake-agent.log}"
+printf '%s\t%s\t%s\n' "$(basename "$0")" "$PWD" "$*" >> "$log"
+if [ -n "$FAKE_AGENT_FAIL_ON" ]; then
+  for a in "$@"; do
+    if [ "$a" = "$FAKE_AGENT_FAIL_ON" ]; then
+      [ -n "$FAKE_AGENT_FAIL_SIGNAL" ] && kill -s "$FAKE_AGENT_FAIL_SIGNAL" $$
+      exit 1
+    fi
+  done
+fi
+exec sleep "${FAKE_AGENT_SLEEP:-3600}"

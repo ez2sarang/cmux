@@ -55,20 +55,13 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   exit 1
 fi
 
-# claude CLI 경로 탐색
-CLAUDE_BIN=""
-if [[ -x "/opt/homebrew/bin/claude" ]]; then
-  CLAUDE_BIN="/opt/homebrew/bin/claude"
-elif [[ -x "/usr/local/bin/claude" ]]; then
-  CLAUDE_BIN="/usr/local/bin/claude"
-elif command -v claude >/dev/null 2>&1; then
-  CLAUDE_BIN="$(command -v claude)"
+# claude CLI 확인 — 탐색 규칙은 cmux 실행 시와 같다 (bin/cmux-agents.zsh)
+source "${SCRIPT_DIR}/bin/cmux-agents.zsh"
+if _agent_call claude bin; then
+  _ok "Claude CLI: $REPLY"
 else
   _warn "claude CLI를 찾지 못했습니다. CMUX_CLAUDE_BIN 환경변수로 경로를 지정하세요."
-  CLAUDE_BIN="claude"
 fi
-
-[[ -n "$CLAUDE_BIN" && "$CLAUDE_BIN" != "claude" ]] && _ok "Claude CLI: $CLAUDE_BIN"
 
 # ── 설치 경로 설정 ─────────────────────────────────────
 BIN_DIR="${HOME}/.local/bin"
@@ -89,14 +82,21 @@ _install_bin() {
     return 0
   fi
 
-  cp "$src" "$dst"
-  chmod +x "$dst"
+  # 원자적 교체: 같은 디렉토리의 임시파일에 복사한 뒤 mv
+  # (cp로 덮어쓰면 실행 중인 cmux(zsh)가 읽고 있는 파일 내용이 바뀐다)
+  local tmp="${dst}.tmp.$$"
+  cp "$src" "$tmp"
+  chmod +x "$tmp"
+  mv -f "$tmp" "$dst"
   _ok "$name → $dst"
 }
 
 _info "바이너리 설치 중..."
-_install_bin "${SCRIPT_DIR}/bin/cmux"        "${BIN_DIR}/cmux"
-_install_bin "${SCRIPT_DIR}/bin/cmux-picker" "${BIN_DIR}/cmux-picker"
+# cmux가 쓰는 파일을 먼저, cmux를 마지막에 설치한다
+_install_bin "${SCRIPT_DIR}/bin/cmux-agents.zsh" "${BIN_DIR}/cmux-agents.zsh"
+_install_bin "${SCRIPT_DIR}/bin/cmux-picker"     "${BIN_DIR}/cmux-picker"
+_install_bin "${SCRIPT_DIR}/bin/cmux-bar"        "${BIN_DIR}/cmux-bar"
+_install_bin "${SCRIPT_DIR}/bin/cmux"            "${BIN_DIR}/cmux"
 
 # ── zellij 설정 설치 ──────────────────────────────────
 _info "zellij 레이아웃 설치 중..."
@@ -110,14 +110,13 @@ _install_layout() {
     return 0
   fi
 
-  # CMUX_BAR_BIN → CMUX_BIN → CLAUDE_BIN 순서로 플레이스홀더 치환
+  # CMUX_BAR_BIN → CMUX_BIN 순서로 플레이스홀더 치환
   # (claude pane은 'cmux launch'를 실행 — 이전 대화가 있으면 --continue 로 이어감)
   local cmux_bar_path="${BIN_DIR}/cmux-bar"
   local cmux_path="${BIN_DIR}/cmux"
   sed \
     -e "s|CMUX_BAR_BIN|${cmux_bar_path}|g" \
     -e "s|CMUX_BIN|${cmux_path}|g" \
-    -e "s|CLAUDE_BIN|${CLAUDE_BIN}|g" \
     "$tmpl" > "$dst"
   _ok "$(basename "${tmpl%.tmpl}") → $dst"
 }

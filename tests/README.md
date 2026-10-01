@@ -1,0 +1,21 @@
+# cmux 테스트
+
+- 실행: `zsh tests/run.zsh [unit|integration|all]`(기본 all). 순서는 구문검사(`zsh -n`·`sh -n`·python ast, shellcheck 미설치) → 단위 → 통합이고, 하나라도 실패하면 비0으로 끝난다.
+- 통합 테스트는 실제 zellij 세션 `cmuxt<pid>`를 pty(`tests/lib/ptyrun.py`, 200x50, SIGTERM이면 창 닫기=HUP)에서 띄운다. 가짜 에이전트 `tests/bin/fake-agent`가 실행 인자와 cwd를 기록한다.
+- 대상 교체: `CMUX_UNDER_TEST=/경로/cmux`(기본은 레포 `bin/cmux`). 실패를 진단할 때 `T_KEEP=1`을 주면 임시 루트(`/private/tmp/cmuxt.*`)가 남는다.
+- 격리 env(harness가 설정): `CMUX_SESSION` `CMUX_ROOT` `CMUX_TABS_FILE` `CMUX_LAYOUTS_DIR`(tmpl을 install.sh와 같은 sed 규칙으로 렌더링) `CMUX_BAR_BIN`/`CMUX_PICKER_BIN`(스텁) `CLAUDE_CONFIG_DIR` `CMUX_{CLAUDE,CODEX,OPENCODE,GEMINI}_BIN`(fake-*) `FAKE_AGENT_LOG` `FAKE_AGENT_SLEEP`(실행마다 고유값) `ZDOTDIR`(pane zsh가 사용자 rc를 읽지 않게). 테스트가 직접 주는 것: `FAKE_AGENT_FAIL_ON=<인자>`(그 인자가 있으면 가짜 에이전트가 기록 후 곧바로 exit 1 — 예: `--continue` 실패 흉내), `FAKE_AGENT_FAIL_SIGNAL=<신호>`(그때 exit 1 대신 그 신호로 죽음 — 예: KILL → rc 137).
+- **순차로만 실행한다.** zellij 0.45.1 #5632: 새 서버가 첫 클라이언트를 초기화하기 전에 다른 zellij CLI(`list-sessions`·`action …`·`delete-session` 등 — 모두 모든 세션 소켓을 건드린다)가 붙었다 끊으면 서버가 panic하고(`$TMPDIR/zellij-$UID/zellij-log/zellij.log`에 `zellij-server/src/lib.rs:1462`) 세션을 만들던 클라이언트는 화면 없이 멈춘다. 병렬 실행은 이 확률을 크게 올린다. harness는 새 세션이 생길 수 있는 cmux 실행 뒤 `session-metadata.kdl`이 쓰일 때까지 소켓 조회를 미루고(`t_zj_gate`), 생존·소멸은 상태(서버 프로세스·소켓·session_info)로 보며, 폴링은 0.3초 간격이다. 테스트에서 zellij를 직접 부를 때도 `t_zj_gate` 뒤에 둔다. 실패하면 "실패 진단"에 그 테스트 동안의 `lib.rs:1462` panic 건수가 나온다.
+- 단위 테스트(`tests/unit/t*.zsh`)는 zellij 세션 없이 `CMUX_SOURCE_ONLY=1 source "$CMUX_UNDER_TEST"`로 함수만 로드한다. harness의 어서션 함수만 쓰고, 임시 `HOME`과 PATH 맨 앞의 가짜 `zellij`(호출 기록만)로 격리한다 — 실제 zellij 호출 0을 끝에서 확인.
+- 안전: 라이브 세션 `claude`는 조회만 한다(시작 때 탭 스냅샷을 찍고 끝에서 비교, 세션이 없으면 SKIP). `ZELLIJ*` env를 제거하고 zellij는 항상 `-s cmuxt<pid>`로 부르며, cmux를 실행하기 전에 세션명 가드를 거친다.
+- 금지: `kill-all-sessions`·`delete-all-sessions`·`pkill zellij`. 정리 대상은 자기 세션과, 명령줄에 자기 임시 루트·고유 sleep 값·세션명이 있는 프로세스뿐이다.
+- 사용자 홈 설정(`~/.config/cmux`, `~/.config/zellij`, `~/.claude`, `~/.local/bin`)에는 쓰지 않는다. `cmux add/rm`은 `~/.config/cmux/projects`에 쓰므로 테스트하지 않는다.
+- 새 테스트 작성: `tests/integration/tNN_*.zsh`에서 `source ../lib/harness.zsh` → `t_live_snapshot; t_setup` → `t_scenario`/`t_cmux`/`t_cmux_bg`/`t_hup`/`t_assert_*`/`t_wait_for` → `t_finish; exit $?`.
+
+## 발견 (현행 bin/cmux + zellij 0.45.1, 2026-10-01 실측)
+- `cmux kill`은 세션을 실제로 죽이고도 "세션이 없거나 이미 종료됨"을 출력한다. 활성 세션에 `zellij delete-session --force`를 실행하면 세션은 종료되지만 rc=2("Session not found")가 나오고, 폴백인 `kill-session`도 rc=1이라 else 분기로 빠진다. cmux 자체의 종료코드는 0이다. `-k`는 `|| true`로 받기 때문에 겉으로 드러나지 않는다.
+- 클라이언트가 붙지 않은 세션은 `list-tabs -s`의 ACTIVE가 전부 false이고, 밖에서 실행한 `current-tab-info`는 "No active tab found"로 실패한다. 그래서 밖에서는 `go-to-tab-name` 포커스를 검증할 수 없고, 테스트도 포커스를 검사하지 않는다.
+- 복원(`_open_many`/`_open_one`)할 때 `session-tabs`가 다시 기록되며, 빈 줄과 **그 시점에 존재하지 않는 경로가 영구히 사라진다**. 예를 들어 외장 볼륨이 잠시 빠져 있던 프로젝트는 다음 복원에서 기록을 잃는다. B5가 이 동작을 고정한다.
+- `_attach_then_add_tabs`의 탭 추가는 백그라운드 서브셸이 맡는다. 기록(`_tabs_append`)은 탭마다 new-tab 직후에 남는다. 서브셸이 끝나기 전에 터미널이 닫히면(HUP) 남은 탭 추가·기록·포커스 이동이 끊길 수 있다고 추정하지만 검증하지는 않았다. 테스트는 서브셸이 끝난 것을 확인한 뒤에 HUP한다.
+- `EXTRAS_FILE`(`~/.config/cmux/projects`)은 env로 바꿀 수 없다. `_tabs_sync_live`가 탭 이름(basename)으로 경로를 역추적할 때 후보로 읽기만 하므로, 같은 basename의 등록 경로가 있으면 이론상 매핑이 섞일 수 있다(테스트 프로젝트명은 alpha/beta).
+- 세션을 만들던 클라이언트뿐 아니라 진행 중이던 `zellij -s <세션> action …`도 서버가 #5632로 죽으면 접속 재시도 루프(nanosleep+connect)에 빠져 끝나지 않는다(25분 정지 실측). cmux의 `_client_attached`·`new-tab`·`query-tab-names` 호출도 같은 상황에서 멈출 수 있다.
+- pane의 `cmux launch`는 물리 경로(`/private/tmp/...`) PWD로 실행된다. `cmux <경로>`도 realpath를 기록한다. 그래서 harness는 임시 루트를 물리 경로로 통일해 jsonl 키(`[^A-Za-z0-9]→-`)가 일치하게 한다.

@@ -21,16 +21,18 @@ TABS_FILE="${CMUX_TABS_FILE:-${HOME}/.config/cmux/session-tabs}"
 # 자기 자신의 절대 경로 (zellij pane 명령으로 사용)
 CMUX_SELF="${0:A}"
 
-# claude 바이너리 탐색: CMUX_CLAUDE_BIN 환경변수 → brew → which
-if [[ -n "$CMUX_CLAUDE_BIN" ]]; then
-  CLAUDE_BIN="$CMUX_CLAUDE_BIN"
-elif [[ -x "/opt/homebrew/bin/claude" ]]; then
-  CLAUDE_BIN="/opt/homebrew/bin/claude"
-elif [[ -x "/usr/local/bin/claude" ]]; then
-  CLAUDE_BIN="/usr/local/bin/claude"
-else
-  CLAUDE_BIN="$(command -v claude 2>/dev/null || echo "claude")"
+# 에이전트 어댑터 (cmux 옆의 cmux-agents.zsh → 설치 위치 ~/.local/bin)
+CMUX_AGENTS_LIB="${CMUX_SELF:h}/cmux-agents.zsh"
+[[ -f "$CMUX_AGENTS_LIB" ]] || CMUX_AGENTS_LIB="${HOME}/.local/bin/cmux-agents.zsh"
+if [[ ! -f "$CMUX_AGENTS_LIB" ]]; then
+  echo "cmux: 에이전트 어댑터 파일이 없습니다 — ${CMUX_SELF:h}/cmux-agents.zsh (install.sh 로 다시 설치하세요)" >&2
+  [[ -n "$CMUX_SOURCE_ONLY" ]] && return 1
+  exit 1
 fi
+source "$CMUX_AGENTS_LIB"
+
+# claude 바이너리 (도움말 표시용): CMUX_CLAUDE_BIN 환경변수 → brew → which
+_agent_call claude bin && CLAUDE_BIN="$REPLY" || CLAUDE_BIN="claude"
 
 # cmux-picker 바이너리 경로 (설치 위치 자동 탐색)
 CMUX_PICKER_BIN="${CMUX_PICKER_BIN:-$(dirname "$0")/cmux-picker}"
@@ -488,6 +490,42 @@ _pick_flow() {
   fi
 }
 
+# ── 에이전트 실행 (pane 진입점) ───────────────────────
+# 이전 대화가 있으면 이어하기 인자를 붙인다. 이어하기가 곧바로 실패하면(fastfail초 안에 rc 1~128로 종료)
+# 새 대화로 1회만 다시 실행한다 — 예: claude 폴더에 요약(sdk-cli) 세션만 있어 --continue가 rc=1로 끝날 때.
+# 신호로 끝난 경우(rc>128 — pane 닫기·Ctrl+C·kill)는 실패가 아니므로 다시 실행하지 않는다.
+# 재실행 판단을 위해 exec 대신 자식으로 실행한다 (stdin/tty 상속, pane을 닫으면 SIGHUP이 함께 간다).
+_launch_agent() {
+  local agent="$1"
+  _agent_call "$agent" label
+  local label="$REPLY"
+
+  if ! _agent_call "$agent" bin || ! command -v -- "$REPLY" >/dev/null 2>&1; then
+    # 실행 파일이 없으면 pane을 닫지 않고 셸로 남긴다 — 탭과 나머지 복원은 그대로
+    _warn "${label} 실행 파일을 찾지 못했습니다 (환경변수 CMUX_${(U)agent}_BIN 로 지정) — 셸로 전환합니다"
+    exec zsh -i
+  fi
+  local bin="$REPLY"
+
+  local -a perm resume fresh
+  _agent_call "$agent" perm_args auto; perm=("${reply[@]}")
+  _agent_call "$agent" fresh_args;     fresh=("${reply[@]}")
+  _agent_call "$agent" has_history "$PWD" && { _agent_call "$agent" resume_args; resume=("${reply[@]}") }
+
+  if (( ${#resume} )); then
+    _agent_call "$agent" fastfail
+    local fastfail="$REPLY" t0=$SECONDS rc
+    "$bin" "${perm[@]}" "${resume[@]}"
+    rc=$?
+    (( rc >= 1 && rc <= 128 && SECONDS - t0 < fastfail )) || return $rc
+  fi
+  "$bin" "${perm[@]}" "${fresh[@]}"
+}
+
+# 테스트용: 함수 정의만 로드하고 디스패처는 실행하지 않는다 (CMUX_SOURCE_ONLY=1 source bin/cmux)
+# source일 때만 — env가 새어도 실행(pane의 'cmux launch' 등)은 영향받지 않게
+[[ -n "$CMUX_SOURCE_ONLY" && "$ZSH_EVAL_CONTEXT" == *:file ]] && return 0
+
 # ── 서브커맨드 ────────────────────────────────────────
 case "$1" in
   -h|--help)
@@ -511,27 +549,22 @@ case "$1" in
     ;;
 
   launch)
-    # zellij claude pane 진입점 — 해당 디렉토리에 이전 대화가 있으면 --continue
-    local ldir="${2:-$PWD}"
-    [[ -d "$ldir" ]] && cd "$ldir"
-
-    local cfg="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
-    local -a launch_args=("--dangerously-skip-permissions")
-    local key_logical="${PWD//[^A-Za-z0-9]/-}"
-    local phys
-    phys="$(pwd -P)"
-    local key_phys="${phys//[^A-Za-z0-9]/-}"
-
-    local k
-    for k in "$key_logical" "$key_phys"; do
-      local -a found=("$cfg/projects/$k"/*.jsonl(N))
-      if [[ ${#found[@]} -gt 0 ]]; then
-        launch_args+=("--continue")
-        break
-      fi
+    # zellij 에이전트 pane 진입점 — cmux launch [경로] [--agent <이름>] (기본 claude)
+    shift
+    local ldir="$PWD" lagent="claude"
+    while (( $# )); do
+      case "$1" in
+        --agent) lagent="$2"; shift; (( $# )) && shift ;;
+        *)       ldir="$1"; shift ;;
+      esac
     done
-
-    exec "$CLAUDE_BIN" "${launch_args[@]}"
+    if ! _agent_known "$lagent"; then
+      _warn "알 수 없는 에이전트: '${lagent}' (사용 가능: ${CMUX_AGENTS[*]})" >&2
+      exit 1
+    fi
+    [[ -d "$ldir" ]] && cd "$ldir"
+    _launch_agent "$lagent"
+    exit $?
     ;;
 
   add)

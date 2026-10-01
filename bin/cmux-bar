@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""
+cmux-bar — zellij 상단 툴바 (탭 바 바로 아래)
+마우스 클릭 또는 키 입력으로 동작:
+  p / [◉ Picker] → 프로젝트 피커 (floating pane)
+  x / [× Close]  → 현재 탭 닫기
+  q / [⏻ Quit]   → 세션 종료
+"""
+
+import curses
+import os
+import subprocess
+import signal
+import sys
+
+
+SESSION = os.environ.get("ZELLIJ_SESSION_NAME", "")
+
+BUTTONS = [
+    (" ◉ Picker ", "p", "picker"),
+    (" × Close ",  "x", "close"),
+    (" ⏻ Quit  ",  "q", "quit"),
+]
+
+SEP = "│"
+
+
+def do_action(action: str) -> None:
+    cmds = {
+        "picker": [
+            "zellij", "action", "new-pane",
+            "-f", "-c", "-n", "cmux-picker",
+            "--", "/bin/zsh", "-ic", "cmux",
+        ],
+        "close": ["zellij", "action", "close-tab"],
+        "quit":  ["zellij", "action", "quit"],
+    }
+    cmd = cmds.get(action)
+    if cmd:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def draw(stdscr, btn_ranges: list) -> None:
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+
+    C_LOGO = curses.color_pair(1)
+    C_SEP  = curses.color_pair(2)
+    C_BTN  = curses.color_pair(3)
+    C_SESS = curses.color_pair(4)
+
+    col = 0
+    btn_ranges.clear()
+
+    def safe_addstr(y: int, x: int, text: str, attr: int = 0) -> int:
+        """Draw text clipped to terminal width; return next column."""
+        remaining = w - x - 1  # leave last cell for curses safety
+        if remaining <= 0 or y >= h:
+            return x
+        clipped = text[: remaining]
+        try:
+            stdscr.addstr(y, x, clipped, attr)
+        except curses.error:
+            pass
+        return x + len(clipped)
+
+    # Logo
+    col = safe_addstr(0, col, " cmux ", C_LOGO | curses.A_BOLD)
+    col = safe_addstr(0, col, SEP, C_SEP)
+
+    # Buttons
+    for label, key, action in BUTTONS:
+        start = col
+        col = safe_addstr(0, col, label, C_BTN | curses.A_BOLD)
+        end = col - 1
+        btn_ranges.append((start, end, action))
+        col = safe_addstr(0, col, SEP, C_SEP)
+
+    # Session name on the right
+    if SESSION:
+        sess_str = f" {SESSION} "
+        sess_col = w - len(sess_str) - 1
+        if sess_col > col:
+            safe_addstr(0, sess_col, sess_str, C_SESS)
+
+    stdscr.refresh()
+
+
+def bar_main(stdscr) -> None:
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+
+    # Colors
+    curses.init_pair(1, curses.COLOR_GREEN,  -1)   # logo
+    curses.init_pair(2, 8,                   -1)   # separator (dim gray)
+    curses.init_pair(3, curses.COLOR_CYAN,   -1)   # buttons
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)   # session name
+
+    # Enable mouse (all events)
+    curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+
+    stdscr.timeout(5000)  # refresh every 5s (picks up resize, session name changes)
+
+    btn_ranges: list = []  # (start_col, end_col, action)
+
+    while True:
+        draw(stdscr, btn_ranges)
+
+        k = stdscr.getch()
+
+        if k == -1:
+            continue  # timeout → redraw
+
+        if k == ord("p"):
+            do_action("picker")
+        elif k == ord("x"):
+            do_action("close")
+        elif k in (ord("q"), ord("Q")):
+            do_action("quit")
+        elif k == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, _ = curses.getmouse()
+                if my == 0:
+                    for start, end, action in btn_ranges:
+                        if start <= mx <= end:
+                            do_action(action)
+                            break
+            except curses.error:
+                pass
+        elif k == curses.KEY_RESIZE:
+            pass  # just redraw on next iteration
+
+
+def main() -> None:
+    signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    curses.wrapper(bar_main)
+
+
+if __name__ == "__main__":
+    main()
