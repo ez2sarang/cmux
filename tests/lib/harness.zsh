@@ -4,7 +4,7 @@
 #   - 라이브 세션(T_LIVE_SESSION)은 조회(list-sessions / query-tab-names)만 한다.
 #   - zellij 호출은 항상 -s "$T_SESSION"(cmuxt<pid>) 명시. ZELLIJ* env는 source 시점에 제거한다.
 #   - cmux 실행 전 _t_guard가 CMUX_SESSION=cmuxt<숫자>를 확인한다 (기본값 'claude'로 새는 것 차단).
-#   - 사용자 홈 설정은 쓰지 않는다 — CMUX_TABS_FILE / CMUX_CONFIG_FILE / CMUX_PROJECT_AGENTS_FILE / CMUX_EXTRAS_FILE /
+#   - 사용자 홈 설정은 쓰지 않는다 — CMUX_TABS_FILE / CMUX_CONFIG_FILE / CMUX_PROJECT_AGENTS_FILE / CMUX_EXTRAS_FILE / CMUX_AGENT_ARGS_FILE /
 #     CMUX_LAYOUTS_DIR / CLAUDE_CONFIG_DIR / ZDOTDIR 를 임시 루트(T_ROOT)로 격리. 예외: zellij가 세션마다 만드는 캐시(session_info/<테스트세션>)는 정리 때 지운다.
 #   - zellij 0.45.1 #5632: 새 서버가 첫 클라이언트를 초기화하기 전에 다른 zellij CLI가 소켓에 붙었다 끊으면
 #     서버가 panic하고(zellij.log: zellij-server/src/lib.rs:1462) 세션을 만들던 클라이언트는 화면 없이 멈춘다.
@@ -131,6 +131,7 @@ t_setup() {
   export CMUX_CONFIG_FILE="$T_ROOT/cfg/config"
   export CMUX_PROJECT_AGENTS_FILE="$T_ROOT/cfg/project-agents"
   export CMUX_EXTRAS_FILE="$T_ROOT/cfg/projects"
+  export CMUX_AGENT_ARGS_FILE="$T_ROOT/cfg/agent-args"
   unset CMUX_AGENT CMUX_DEFAULT_AGENT
   export CMUX_LAYOUTS_DIR="$T_ROOT/layouts"
   export CMUX_BAR_BIN="$T_ROOT/bin/cmux-bar-stub"

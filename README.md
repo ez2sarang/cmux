@@ -142,6 +142,14 @@ export CMUX_ROOT="/your/project/root"
 export CMUX_CLAUDE_BIN="/custom/path/to/claude"
 ```
 
+### 프로젝트별 에이전트 실행 인자
+
+`~/.config/cmux/agent-args`(환경변수 `CMUX_AGENT_ARGS_FILE`로 변경)에 `대상<TAB>에이전트<TAB>인자`를 한 줄씩 적으면, 그 폴더의 그 에이전트는 권한 프로파일(`CMUX_<A>_PERM`) 인자 대신 이 인자로 시작합니다. 대상은 절대경로 또는 `*`(모든 폴더, 경로 줄이 우선), 인자 안의 `{dir}`은 프로젝트 폴더로 바뀝니다.
+인자는 따옴표만 벗기고 어떤 확장(`$VAR`·`$(…)`·`~`·glob)도 하지 않습니다. 예: `/path/KIS<TAB>codex<TAB>--sandbox workspace-write --ask-for-approval on-request -c sandbox_workspace_write.network_access=true`
+줄에는 **플래그만** 적습니다 — 이어하기 인자(codex `resume --last`, claude `--continue`, opencode `-s <id>`)는 cmux가 붙이므로 `resume --last`를 넣으면 중복됩니다. 구분자는 반드시 TAB이고(공백은 조용히 무시), 적용되면 시작 배너 아래에 `사용자 인자(…)` 줄이 보입니다. 위험 인자(`--dangerously-bypass-approvals-and-sandbox` 등)도 검사하지 않고 그대로 넘기며, `*` 줄은 모든 폴더의 기본 권한(safe)보다 우선합니다.
+추가 예: `printf '%s\t%s\t%s\n' /path/KIS codex '--cd {dir} --sandbox workspace-write --ask-for-approval on-request' >> ~/.config/cmux/agent-args`
+자세한 규칙: `doc/2026-10-01-multi-agent-design.md` §16
+
 ## 파일 구성
 
 ```
