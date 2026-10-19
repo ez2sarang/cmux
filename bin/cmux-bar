@@ -1,28 +1,635 @@
 #!/usr/bin/env python3
 """
-cmux-bar — zellij 상단 툴바 (탭 바 바로 아래)
-마우스 클릭 또는 키 입력으로 동작:
+cmux-bar — zellij 상단 탭 줄 + 툴바 (직접 그리는 curses 바)
+
+두 모드 (pane 내용 행 수로 자동 선택):
+  스트립 모드 (내용 2행 이상, 새 레이아웃의 size=3 pane — 네이티브 tab-bar 플러그인 없음)
+    접힘(1): 0행 = 탭 1줄 + 토글 ▾,  1행 = 툴바 (cmux │ Picker │ Close │ Quit │ 세션명)
+    펼침(2): 0·1행 = 탭 2줄 (0행 오른쪽 끝 토글 ▴, 1행 오른쪽 끝 축약 아이콘 ◉ × ⏻)
+  레거시 모드 (내용 1행, 옛 레이아웃 — 위에 네이티브 tab-bar가 따로 있다): 툴바 1행만 그린다.
+
+조작:
+  탭 이름 클릭   → 그 탭으로 이동        마우스 휠 위/아래 → 이전/다음 탭
+  ▾/▴ 클릭 · t   → 1줄 ↔ 2줄 토글 (상태 파일 공유 → 모든 탭이 즉시 따라간다)
   p / [◉ Picker] → 프로젝트 피커 (floating pane)
-  x / [× Close]  → 현재 탭 닫기
-  q / [⏻ Quit]   → 세션 종료
+  [× Close]      → 현재 탭 닫기 (클릭 전용 — x 키 없음)
+  [⏻ Quit]       → 세션 종료 (클릭 전용 — q 키 없음)
+  x·q 단축키는 일부러 없앴다: 클릭이 바 pane에 포커스를 남겨 두면 나중에 그 탭에서 친 x/q가
+  탭·에이전트·세션을 닫아 버리는 사고가 난다. 클릭한 바는 자기 탭 본문 pane으로 포커스를 돌려놓는다
+  (picker 클릭은 예외 — 새 floating pane이 포커스를 가져간다).
+
+공유 상태 (표준 라이브러리만, 네트워크·LLM 없음):
+  토글 상태 파일  ${CMUX_TABBAR_STATE_FILE:-$HOME/.config/cmux/tabbar-rows}  (1 또는 2, 없으면 1)
+  탭 목록 캐시    ${CMUX_BAR_CACHE_DIR:-${TMPDIR:-/tmp}/cmux-bar-$UID}/tabs-<세션>.json
+                  리더 1개만 1초마다 `zellij action list-tabs --json`을 부르고 나머지는 파일만 읽는다.
 """
 
 import curses
+import json
+import locale
 import os
-import subprocess
+import re
+import shutil
 import signal
+import subprocess
 import sys
+import time
+import unicodedata
 
 
 SESSION = os.environ.get("ZELLIJ_SESSION_NAME", "")
 
 BUTTONS = [
-    (" ◉ Picker ", "p", "picker"),
-    (" × Close ",  "x", "close"),
-    (" ⏻ Quit  ",  "q", "quit"),
+    (" ◉ Picker ", "p",  "picker"),
+    (" × Close ",  None, "close"),    # 클릭 전용 (키 없음)
+    (" ⏻ Quit  ",  None, "quit"),     # 클릭 전용 (키 없음)
 ]
 
+# 바 pane에서 먹는 키 (x·q는 없다 — 위 docstring 참고)
+KEY_ACTIONS = {
+    ord("p"): ("action", "picker"),
+    ord("t"): ("toggle", None),
+    ord("T"): ("toggle", None),
+}
+
+AGENT_PANE_NAMES = ("claude", "codex", "opencode", "gemini")   # 포커스를 돌려놓을 본문 pane 이름(우선순위)
+MY_PANE_ID = os.environ.get("ZELLIJ_PANE_ID", "")
+
 SEP = "│"
+
+# 축약 아이콘 (펼침 모드 1행 오른쪽 끝) — 각 3칸 + 구분선 = 11칸
+ICONS = [(" ◉ ", "picker"), (" × ", "close"), (" ⏻ ", "quit")]
+ICONS_W = 11
+TOGGLE_W = 3                      # 0행 오른쪽 끝 " ▾ " / " ▴ " (눌림 영역 = 이 3칸)
+TAB_NAME_MAX = 14                 # 탭 이름 최대 칸 수 (넘으면 … 로 자름)
+
+POLL_MS = 400                     # 입력 대기 주기 — 상태 파일 변화는 이 주기 안에 반영된다
+FETCH_SECS = 1.0                  # 리더의 list-tabs 주기
+FIRST_CALL_DELAY = 2.0            # 시작 직후 zellij CLI 금지 구간 (zellij 0.45.1 #5632 서버 panic 회피)
+STALE_SECS = 3.0                  # 캐시가 이만큼 낡으면 팔로워가 리더를 인수한다
+FOLLOWER_CHECK_SECS = 1.5         # 캐시 나이가 이 이상일 때만 팔로워가 리더 상태를 확인한다
+LIST_TABS_TIMEOUT = 3             # list-tabs 응답 대기 상한(초) — 서버가 멎어도 바는 멈추지 않는다
+FETCH_BACKOFF_MAX = 8.0           # 조회 실패 시 재시도 간격 상한(초)
+WHEEL_THROTTLE = 0.1              # 휠 이벤트 최소 간격(초)
+FOCUS_WAIT = 1.0                  # 클릭 처리 때 자기 pane이 포커스를 받기를 기다리는 최대 시간(초)
+
+# 색 쌍 번호 (curses.init_pair)
+CP_LOGO, CP_SEP, CP_BTN, CP_SESS, CP_ACTIVE, CP_MORE = 1, 2, 3, 4, 5, 6
+
+# 마우스: 눌림 이벤트만 받는다 (눌림+뗌을 둘 다 받으면 클릭 한 번에 동작이 두 번 실행된다)
+# BUTTON5(휠 아래)는 ncurses 마우스 버전 1 빌드(macOS 시스템 python 등)에 없을 수 있다 → 0.
+BTN_CLICK = getattr(curses, "BUTTON1_PRESSED", 0) | getattr(curses, "BUTTON1_CLICKED", 0)
+BTN_WHEEL_UP = getattr(curses, "BUTTON4_PRESSED", 0)
+BTN_WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0)
+MOUSE_MASK = getattr(curses, "BUTTON1_PRESSED", 0) | BTN_WHEEL_UP | BTN_WHEEL_DOWN
+
+
+# ── 폭 계산 (한글·이모지는 2칸, 결합문자는 0칸) ────────────────────────────
+
+def char_width(ch: str) -> int:
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def str_width(s: str) -> int:
+    return sum(char_width(c) for c in s)
+
+
+def clip_width(s: str, maxw: int) -> str:
+    """s의 앞부분 중 폭이 maxw 이하인 가장 긴 접두사 (2칸 글자가 걸치면 뺀다)."""
+    out = []
+    w = 0
+    for ch in s:
+        cw = char_width(ch)
+        if w + cw > maxw:
+            break
+        out.append(ch)
+        w += cw
+    return "".join(out)
+
+
+def truncate_name(name: str, maxw: int = TAB_NAME_MAX) -> str:
+    """폭이 maxw를 넘으면 … 를 붙여 maxw 이하로 자른다."""
+    if str_width(name) <= maxw:
+        return name
+    return clip_width(name, maxw - 1) + "…"
+
+
+def tab_label(tab: dict) -> str:
+    """탭 하나의 표시 문자열: 앞뒤 공백 1칸 + 이름(최대 14칸) + 벨 알림이면 '*'."""
+    return " " + truncate_name(tab["name"]) + ("*" if tab["bell"] else "") + " "
+
+
+# ── 탭 목록 정규화 · 창 선택 ───────────────────────────────────────────────
+
+def normalize_tabs(raw) -> list:
+    """list-tabs --json 결과 → [{name, active, id, bell}] (position 순). 형식이 다르면 빈 목록."""
+    if not isinstance(raw, list):
+        return []
+    items = []
+    for i, t in enumerate(raw):
+        if not isinstance(t, dict):
+            continue
+        pos = t.get("position")
+        name = t.get("name")
+        name = name if isinstance(name, str) else ""
+        name = "".join(" " if unicodedata.category(c).startswith("C") else c for c in name)
+        tid = t.get("tab_id")
+        items.append((pos if isinstance(pos, int) else i, i, {
+            "name": name,
+            "active": bool(t.get("active")),
+            "id": tid if isinstance(tid, int) and not isinstance(tid, bool) else None,
+            "bell": bool(t.get("has_bell_notification")),
+        }))
+    items.sort(key=lambda x: (x[0], x[1]))
+    return [t for _, _, t in items]
+
+
+def active_index(tabs: list) -> int:
+    """활성 탭 위치 (없으면 0 — 클라이언트가 안 붙은 세션은 활성 표시가 전부 false)."""
+    for i, t in enumerate(tabs):
+        if t["active"]:
+            return i
+    return 0
+
+
+def strip_caps(w: int, rows: int) -> list:
+    """줄별 탭 영역 폭: 0행은 오른쪽 토글 영역, (펼침의) 1행은 오른쪽 아이콘 영역을 뺀다."""
+    caps = [max(0, w - TOGGLE_W)]
+    if rows >= 2:
+        caps.append(max(0, w - ICONS_W))
+    return caps
+
+
+def _fit(widths: list, lo: int, hi: int, caps: list):
+    """탭 lo..hi(포함)를 줄 순서대로 채워 넣는다. 안 들어가면 None.
+
+    lo>0 이면 0행 왼쪽 끝에 '‹N', hi<끝 이면 마지막 줄 오른쪽 끝에 'N›' 자리를 먼저 비운다.
+    탭은 줄 사이에서 쪼개지지 않는다 (안 들어가는 탭은 다음 줄 맨 앞으로).
+    """
+    n = len(widths)
+    left_txt = "‹%d" % lo if lo > 0 else ""
+    right_txt = "%d›" % (n - 1 - hi) if hi < n - 1 else ""
+    lw = str_width(left_txt)
+    rw = str_width(right_txt)
+    nl = len(caps)
+    lines = [[] for _ in caps]
+    li = 0
+    x = lw
+    for idx in range(lo, hi + 1):
+        tw = widths[idx]
+        while x + tw > caps[li] - (rw if li == nl - 1 else 0):
+            li += 1
+            if li >= nl:
+                return None
+            x = 0
+        lines[li].append((idx, x, tw))
+        x += tw
+    return {
+        "lo": lo, "hi": hi, "lines": lines,
+        "left": (left_txt, 0) if left_txt else None,
+        "right": (right_txt, caps[-1] - rw) if right_txt else None,
+    }
+
+
+def plan_tabs(widths: list, active: int, caps: list) -> dict:
+    """보여줄 탭 창과 배치를 정한다 (활성 탭은 항상 창 안).
+
+    전부 들어가면 전부. 아니면 활성 탭에서 시작해 좌우 번갈아(균형) 넓히고,
+    잘린 쪽 가장자리에 숨은 개수('‹N' 왼쪽, 'N›' 오른쪽)를 표시한다.
+    반환: {lo, hi, lines: [[(탭 번호, x, 폭)]], left: (글자, x)|None, right: (글자, x)|None}
+    활성 탭 하나도 안 들어가면 활성 탭만 영역 폭으로 잘라서 보여준다.
+    """
+    n = len(widths)
+    caps = list(caps) or [0]
+    if n == 0:
+        return {"lo": 0, "hi": -1, "lines": [[] for _ in caps], "left": None, "right": None}
+    active = min(max(active, 0), n - 1)
+    full = _fit(widths, 0, n - 1, caps)
+    if full:
+        return full
+    best = _fit(widths, active, active, caps)
+    if not best:
+        lines = [[] for _ in caps]
+        lines[0].append((active, 0, min(widths[active], caps[0])))
+        return {"lo": active, "hi": active, "lines": lines, "left": None, "right": None}
+    lo = hi = active
+    blocked = {"L": False, "R": False}
+    while not (blocked["L"] and blocked["R"]):
+        order = ("L", "R") if (active - lo) <= (hi - active) else ("R", "L")
+        grew = False
+        for side in order:
+            if blocked[side]:
+                continue
+            nlo, nhi = (lo - 1, hi) if side == "L" else (lo, hi + 1)
+            if nlo < 0 or nhi > n - 1:
+                blocked[side] = True
+                continue
+            cand = _fit(widths, nlo, nhi, caps)
+            if cand:
+                best, lo, hi, grew = cand, nlo, nhi, True
+                break
+            blocked[side] = True
+        if not grew and blocked["L"] and blocked["R"]:
+            break
+    return best
+
+
+# ── 토글 상태 파일 ─────────────────────────────────────────────────────────
+
+def state_path() -> str:
+    p = os.environ.get("CMUX_TABBAR_STATE_FILE")
+    if p:
+        return p
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    return os.path.join(home, ".config", "cmux", "tabbar-rows")
+
+
+def read_rows(path: str) -> int:
+    """상태 파일 → 1 또는 2 (없거나 이상한 내용이면 1)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return 2 if f.read(16).strip() == "2" else 1
+    except OSError:
+        return 1
+
+
+def write_atomic(path: str, text: str) -> bool:
+    """임시 파일 → os.replace. 실패하면 False (예외 없음)."""
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def write_rows(path: str, rows: int) -> bool:
+    return write_atomic(path, "%d\n" % (2 if rows == 2 else 1))
+
+
+def toggle_rows(path: str) -> int:
+    """1↔2 토글하고 (쓰기 실패하면 실제 파일 상태를) 반환."""
+    write_rows(path, 1 if read_rows(path) == 2 else 2)
+    return read_rows(path)
+
+
+# ── 탭 목록 캐시 · 리더 선출 ───────────────────────────────────────────────
+
+def cache_dir_path() -> str:
+    d = os.environ.get("CMUX_BAR_CACHE_DIR")
+    if d:
+        return d
+    return os.path.join(os.environ.get("TMPDIR") or "/tmp", "cmux-bar-%d" % os.getuid())
+
+
+def cache_paths(cache_dir: str, session: str):
+    """(캐시 파일, 락 디렉터리) — 락 디렉터리 안에 pid 파일."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session) or "nosession"
+    return (os.path.join(cache_dir, "tabs-%s.json" % safe),
+            os.path.join(cache_dir, "tabs-%s.lock" % safe))
+
+
+def ensure_cache_dir(cache_dir: str) -> bool:
+    """캐시 디렉터리를 0700으로 만들고(없으면), 내 소유가 아니면 쓰지 않는다."""
+    try:
+        os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+        return os.stat(cache_dir).st_uid == os.getuid()
+    except OSError:
+        return False
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_pid(pid_file: str):
+    try:
+        with open(pid_file, encoding="utf-8") as f:
+            return int(f.read(32).strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _mtime(path: str):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def _acquire(lock_dir: str, my_pid: int) -> bool:
+    try:
+        os.mkdir(lock_dir)
+    except OSError:
+        return False
+    write_atomic(os.path.join(lock_dir, "pid"), "%d\n" % my_pid)
+    return True
+
+
+def elect_leader(lock_dir: str, cache_file: str, my_pid: int, now: float, alive=pid_alive) -> bool:
+    """내가 리더가 되면(또는 이미 리더면) True.
+
+    mkdir 락 + pid 파일. 보유자가 죽었거나, 캐시·하트비트(pid 파일 mtime)가 STALE_SECS 이상
+    낡았으면 락 디렉터리를 rename으로 치우고(한 프로세스만 성공) 다시 mkdir 한다.
+    pid 파일이 아직 없는 젊은 락은 막 만들어지는 중이라 건드리지 않는다.
+    """
+    pid_file = os.path.join(lock_dir, "pid")
+    holder = _read_pid(pid_file)
+    if holder == my_pid:
+        return True
+    if _acquire(lock_dir, my_pid):
+        return True
+    holder = _read_pid(pid_file)
+    if holder is not None and alive(holder):
+        beat = max(_mtime(cache_file) or 0.0, _mtime(pid_file) or 0.0)
+        if now - beat < STALE_SECS:
+            return False
+    elif holder is None:
+        born = _mtime(lock_dir)
+        if born is not None and now - born < STALE_SECS:
+            return False
+    grave = "%s.dead.%d" % (lock_dir, my_pid)
+    try:
+        os.rename(lock_dir, grave)
+    except OSError:
+        return False
+    shutil.rmtree(grave, ignore_errors=True)
+    return _acquire(lock_dir, my_pid)
+
+
+def _zellij_json(args: list, timeout: float):
+    """`zellij action <args>`의 JSON 목록 출력. 실패·시간 초과·이상한 출력이면 None."""
+    try:
+        cp = subprocess.run(
+            ["zellij", "action"] + args,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if cp.returncode != 0:
+        return None
+    try:
+        raw = json.loads(cp.stdout.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    return raw if isinstance(raw, list) else None
+
+
+def fetch_tabs(timeout: float = LIST_TABS_TIMEOUT):
+    """`zellij action list-tabs --json` → 원본 목록. 실패·시간 초과·이상한 출력이면 None."""
+    return _zellij_json(["list-tabs", "--json"], timeout)
+
+
+def _my_pane(panes, my_id):
+    """list-panes 결과에서 자기 터미널 pane(비플러그인, id == my_id) 항목. 없으면 None."""
+    try:
+        me_id = int(my_id)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(panes, list):
+        return None
+    return next((p for p in panes if isinstance(p, dict) and not p.get("is_plugin") and p.get("id") == me_id), None)
+
+
+def pick_focus_target(panes, my_id):
+    """클릭을 처리한 바가 포커스를 돌려놓을 본문 pane id(정수). 없으면 None.
+
+    자기 pane(비플러그인, id == my_id)이 포커스 상태일 때만 동작한다 — 다른 pane의 포커스를 빼앗지 않기 위해.
+    후보 = 같은 탭의 비플러그인·비플로팅·비숨김·selectable pane(자기 제외). 에이전트 이름(claude/codex/opencode/gemini)
+    pane 우선, 없으면 가장 위·왼쪽.
+    """
+    me = _my_pane(panes, my_id)
+    if me is None or not me.get("is_focused"):
+        return None
+    me_id = me["id"]
+    panes = [p for p in panes if isinstance(p, dict)]
+    cands = [
+        p for p in panes
+        if not p.get("is_plugin") and not p.get("is_floating") and not p.get("is_suppressed")
+        and p.get("is_selectable") and p.get("tab_id") == me.get("tab_id") and p.get("id") != me_id
+        and isinstance(p.get("id"), int)
+    ]
+    pool = [p for p in cands if p.get("title") in AGENT_PANE_NAMES] or cands
+    if not pool:
+        return None
+    best = min(pool, key=lambda p: (p.get("pane_y") or 0, p.get("pane_x") or 0))
+    return best["id"]
+
+
+def _run_zellij_action(*args) -> None:
+    subprocess.run(
+        ["zellij", "action"] + list(args),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=LIST_TABS_TIMEOUT,
+    )
+
+
+def _focused_ids(panes, me) -> set:
+    """내 탭에서 포커스 상태인 터미널 pane id 집합."""
+    return {p["id"] for p in panes if isinstance(p, dict) and not p.get("is_plugin")
+            and p.get("tab_id") == me.get("tab_id") and p.get("is_focused")}
+
+
+def restore_focus() -> None:
+    """클릭 처리 전에 자기 탭의 본문 pane으로 포커스를 돌려놓는다 (탭 전환 전에 해야 한다 — 전환 뒤엔 늦다).
+
+    zellij는 포커스 없는 터미널 pane을 클릭하면 그 pane에 포커스를 준다. 이 포커스를 남겨 두면 나중에 그 탭으로
+    돌아와 친 키가 바에 간다. 실패해도 본 동작은 막지 않는다.
+
+    이동은 `focus-next-pane`을 목표 pane이 포커스될 때까지(최대 pane 수만큼) 반복한다. 실측(zellij 0.45.1):
+    `focus-pane-id`는 mouse_click_through가 켜진 상태에서 클릭이 준 포커스를 바꾸지 못한다 — 실제 키보드 포커스는 바에
+    남고 list-panes에 두 pane이 동시에 focused로 보인다. `focus-next-pane`은 두 설정 모두에서 키보드 포커스를 옮긴다.
+    """
+    if not MY_PANE_ID:
+        return
+    try:
+        deadline = time.monotonic() + FOCUS_WAIT
+        while True:
+            panes = _zellij_json(["list-panes", "--json", "--all"], LIST_TABS_TIMEOUT)
+            target = pick_focus_target(panes, MY_PANE_ID)
+            if target is not None:
+                break
+            # mouse_click_through 가 켜져 있으면 클릭이 앱에 전달된 "뒤에" 포커스가 옮겨 올 수 있다 →
+            # 자기 pane이 아직 포커스가 없을 때만 잠깐 기다린다. 끝내 포커스가 없으면 아무것도 하지 않는다.
+            me = _my_pane(panes, MY_PANE_ID)
+            if me is None or me.get("is_focused") or time.monotonic() >= deadline:
+                return
+            time.sleep(0.1)
+        me = _my_pane(panes, MY_PANE_ID)
+        steps = sum(1 for p in panes if isinstance(p, dict) and not p.get("is_plugin") and p.get("tab_id") == me.get("tab_id"))
+        for _ in range(max(steps, 1)):
+            _run_zellij_action("focus-next-pane")
+            panes = _zellij_json(["list-panes", "--json", "--all"], LIST_TABS_TIMEOUT)
+            me = _my_pane(panes, MY_PANE_ID)
+            if me is None or target in _focused_ids(panes, me):
+                return
+    except Exception:  # noqa: BLE001 — 포커스 복귀 실패가 클릭 동작을 막으면 안 된다
+        pass
+
+
+class TabSource:
+    """탭 목록 공급자 — 리더면 list-tabs를 1초마다 불러 캐시에 쓰고, 아니면 캐시 파일만 읽는다."""
+
+    def __init__(self, session: str, cache_dir: str, fetch=fetch_tabs, pid=None):
+        self.cache_file, self.lock_dir = cache_paths(cache_dir, session)
+        self.pid_file = os.path.join(self.lock_dir, "pid")
+        self.cache_dir = cache_dir
+        self.fetch = fetch
+        self.pid = pid or os.getpid()
+        self.usable = ensure_cache_dir(cache_dir)
+        self.tabs = None          # 정규화된 탭 목록 (아직 모르면 None)
+        self.is_leader = False
+        self.next_fetch = 0.0
+        self.next_beat = 0.0      # 리더 하트비트(pid 파일 mtime) 다음 시각 — 조회 백오프가 STALE_SECS보다 길어도 인수당하지 않게
+        self.fail_streak = 0
+        self._sig = None
+
+    def _load_cache(self) -> bool:
+        """캐시 파일이 바뀌었으면 읽는다. 바뀌어서 읽었으면 True."""
+        try:
+            st = os.stat(self.cache_file)
+            sig = (st.st_mtime_ns, st.st_size)
+            if sig == self._sig:
+                return False
+            with open(self.cache_file, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            return False
+        self._sig = sig
+        tabs = normalize_tabs(raw)
+        changed = tabs != self.tabs
+        self.tabs = tabs
+        return changed
+
+    def _refresh(self, now: float, leader: bool) -> bool:
+        if leader:
+            _touch(self.pid_file, now)            # 하트비트 — 조회가 느려도 인수당하지 않게
+        raw = self.fetch()
+        if raw is None:
+            if leader:
+                self.fail_streak += 1
+                self.next_fetch = now + min(FETCH_SECS * (2 ** self.fail_streak), FETCH_BACKOFF_MAX)
+                _touch(self.cache_file, now)      # 리더는 살아 있다 → 팔로워 인수 방지, 마지막 캐시 유지
+            return False
+        text = json.dumps(raw, ensure_ascii=False)
+        if write_atomic(self.cache_file, text):
+            try:
+                st = os.stat(self.cache_file)
+                self._sig = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                self._sig = None
+        tabs = normalize_tabs(raw)
+        changed = tabs != self.tabs
+        self.tabs = tabs
+        if leader:
+            self.fail_streak = 0
+            self.next_fetch = now + FETCH_SECS
+        return changed
+
+    def poll(self, elapsed: float, now: float = None) -> bool:
+        """주기 점검. 탭 목록이 바뀌었으면 True.
+
+        elapsed = 바 프로세스 시작 뒤 경과(초). FIRST_CALL_DELAY 전에는 zellij를 부르지 않고(선출도 안 함),
+        그 전에는 STALE_SECS 이내로 신선한 캐시만 쓴다.
+        """
+        now = time.time() if now is None else now
+        if not self.usable:
+            # 캐시 디렉터리를 못 쓰면 파일 공유 없이 혼자 느리게 조회한다 (거의 없는 경우)
+            if elapsed < FIRST_CALL_DELAY or now < self.next_fetch:
+                return False
+            changed = self._refresh(now, True)
+            self.next_fetch = max(self.next_fetch, now + 3 * FETCH_SECS)
+            return changed
+        mt = _mtime(self.cache_file)
+        age = None if mt is None else max(0.0, now - mt)
+        changed = False
+        if age is not None and (age < STALE_SECS or elapsed >= FIRST_CALL_DELAY):
+            changed = self._load_cache()
+        if elapsed < FIRST_CALL_DELAY:
+            return changed
+        if self.is_leader and now >= self.next_beat:
+            self.next_beat = now + FETCH_SECS
+            if _read_pid(self.pid_file) == self.pid:
+                _touch(self.pid_file, now)        # 하트비트 — 조회 실패 백오프(최대 8초) 중에도 살아 있음을 알린다
+                if self.fail_streak:
+                    _touch(self.cache_file, now)  # 마지막 캐시를 계속 쓰는 중 → 팔로워가 낡았다고 보지 않게
+            else:
+                self.is_leader = False            # 인수당했다
+        if not self.is_leader and (age is None or age >= FOLLOWER_CHECK_SECS):
+            if elect_leader(self.lock_dir, self.cache_file, self.pid, now):
+                self.is_leader = True
+                self.next_fetch = 0.0
+                self.next_beat = now + FETCH_SECS
+        if self.is_leader and now >= self.next_fetch:
+            changed = self._refresh(now, True) or changed
+        return changed
+
+    def refresh_now(self) -> bool:
+        """탭 이동 직후 등 즉시 갱신 (리더가 아니어도 한 번 조회해 캐시를 갱신한다)."""
+        return self._refresh(time.time(), self.is_leader)
+
+    def close(self) -> None:
+        """리더면 락을 반납한다 (내 pid일 때만)."""
+        if self.is_leader and _read_pid(self.pid_file) == self.pid:
+            shutil.rmtree(self.lock_dir, ignore_errors=True)
+        self.is_leader = False
+
+
+def _touch(path: str, when: float = None) -> None:
+    try:
+        os.utime(path, None if when is None else (when, when))
+    except OSError:
+        pass
+
+
+# ── 마우스 ─────────────────────────────────────────────────────────────────
+
+def classify_mouse(bstate: int, mx: int, my: int, hits: list):
+    """마우스 이벤트 → 동작. hits = [(y, x0, x1, 동작)].
+
+    동작: ("nav", zellij 명령) 휠 / ("action", 이름) / ("toggle", None) / ("tab", 탭 id). 해당 없으면 None.
+    """
+    if bstate & BTN_WHEEL_UP:
+        return ("nav", "go-to-previous-tab")
+    if bstate & BTN_WHEEL_DOWN:
+        return ("nav", "go-to-next-tab")
+    if bstate & BTN_CLICK:
+        for y, x0, x1, act in hits:
+            if y == my and x0 <= mx <= x1:
+                return act
+    return None
+
+
+def classify_key(k: int):
+    """키 입력 → 동작 (p 피커, t/T 토글). x·q 등 나머지는 None — 위험한 닫기 키는 일부러 없다."""
+    return KEY_ACTIONS.get(k)
+
+
+# ── 동작 실행 ──────────────────────────────────────────────────────────────
+
+def zellij_action(*args):
+    return subprocess.Popen(
+        ["zellij", "action", *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def do_action(action: str) -> None:
@@ -44,101 +651,272 @@ def do_action(action: str) -> None:
         )
 
 
-def draw(stdscr, btn_ranges: list) -> None:
-    stdscr.erase()
+# ── 그리기 ─────────────────────────────────────────────────────────────────
+
+def put(stdscr, y: int, x: int, text: str, attr: int = 0) -> int:
+    """폭 기준으로 화면 안에 잘라 그리고 다음 칸을 반환 (화면 밖·curses 오류는 무시)."""
+    h, w = stdscr.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w:
+        return x
+    text = clip_width(text, w - x)
+    if not text:
+        return x
+    try:
+        stdscr.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+    return x + str_width(text)
+
+
+def draw_toolbar(stdscr, y: int, hits: list) -> None:
+    """툴바 한 줄 (cmux │ Picker │ Close │ Quit │ … 세션명). 레거시 모드의 유일한 줄이자 접힘 1행."""
     h, w = stdscr.getmaxyx()
 
-    C_LOGO = curses.color_pair(1)
-    C_SEP  = curses.color_pair(2)
-    C_BTN  = curses.color_pair(3)
-    C_SESS = curses.color_pair(4)
+    C_LOGO = curses.color_pair(CP_LOGO)
+    C_SEP  = curses.color_pair(CP_SEP)
+    C_BTN  = curses.color_pair(CP_BTN)
+    C_SESS = curses.color_pair(CP_SESS)
 
     col = 0
-    btn_ranges.clear()
 
-    def safe_addstr(y: int, x: int, text: str, attr: int = 0) -> int:
+    def safe_addstr(yy: int, x: int, text: str, attr: int = 0) -> int:
         """Draw text clipped to terminal width; return next column."""
         remaining = w - x - 1  # leave last cell for curses safety
-        if remaining <= 0 or y >= h:
+        if remaining <= 0 or yy >= h:
             return x
         clipped = text[: remaining]
         try:
-            stdscr.addstr(y, x, clipped, attr)
+            stdscr.addstr(yy, x, clipped, attr)
         except curses.error:
             pass
         return x + len(clipped)
 
     # Logo
-    col = safe_addstr(0, col, " cmux ", C_LOGO | curses.A_BOLD)
-    col = safe_addstr(0, col, SEP, C_SEP)
+    col = safe_addstr(y, col, " cmux ", C_LOGO | curses.A_BOLD)
+    col = safe_addstr(y, col, SEP, C_SEP)
 
     # Buttons
     for label, key, action in BUTTONS:
         start = col
-        col = safe_addstr(0, col, label, C_BTN | curses.A_BOLD)
+        col = safe_addstr(y, col, label, C_BTN | curses.A_BOLD)
         end = col - 1
-        btn_ranges.append((start, end, action))
-        col = safe_addstr(0, col, SEP, C_SEP)
+        hits.append((y, start, end, ("action", action)))
+        col = safe_addstr(y, col, SEP, C_SEP)
 
     # Session name on the right
     if SESSION:
         sess_str = f" {SESSION} "
         sess_col = w - len(sess_str) - 1
         if sess_col > col:
-            safe_addstr(0, sess_col, sess_str, C_SESS)
+            safe_addstr(y, sess_col, sess_str, C_SESS)
 
+
+def draw_legacy(stdscr, hits: list) -> None:
+    """레거시 모드 (pane 내용 1행): 예전과 똑같이 툴바 1행만."""
+    stdscr.erase()
+    hits.clear()
+    draw_toolbar(stdscr, 0, hits)
     stdscr.refresh()
 
 
-def bar_main(stdscr) -> None:
-    curses.curs_set(0)
+def draw_icons(stdscr, y: int, hits: list) -> None:
+    """펼침 모드 1행 오른쪽 끝의 축약 툴바 ' ◉ │ × │ ⏻ '."""
+    h, w = stdscr.getmaxyx()
+    x = w - ICONS_W
+    if x < 0:
+        return
+    C_BTN = curses.color_pair(CP_BTN) | curses.A_BOLD
+    C_SEP = curses.color_pair(CP_SEP)
+    for i, (label, action) in enumerate(ICONS):
+        put(stdscr, y, x, label, C_BTN)
+        hits.append((y, x, x + len(label) - 1, ("action", action)))
+        x += len(label)
+        if i < len(ICONS) - 1:
+            put(stdscr, y, x, SEP, C_SEP)
+            x += 1
+
+
+def draw_strip(stdscr, rows: int, tabs, placeholder: bool, hits: list) -> None:
+    """스트립 모드 (pane 내용 2행 이상): 탭 줄 + 토글, 그리고 접힘이면 툴바 / 펼침이면 2줄째 탭 + 아이콘."""
+    h, w = stdscr.getmaxyx()
+    stdscr.erase()
+    hits.clear()
+    C_MORE = curses.color_pair(CP_MORE)
+    caps = strip_caps(w, rows)
+
+    if placeholder or not tabs:
+        put(stdscr, 0, 0, " … ", C_MORE)
+    else:
+        labels = [tab_label(t) for t in tabs]
+        plan = plan_tabs([str_width(s) for s in labels], active_index(tabs), caps)
+        for li, line in enumerate(plan["lines"]):
+            for idx, x, tw in line:
+                tab = tabs[idx]
+                text = clip_width(labels[idx], tw)
+                if tab["active"]:
+                    attr = curses.color_pair(CP_ACTIVE) | curses.A_BOLD
+                else:
+                    attr = curses.A_NORMAL
+                put(stdscr, li, x, text, attr)
+                if tab["bell"] and tw >= 2 and str_width(labels[idx]) == tw:
+                    put(stdscr, li, x + tw - 2, "*", (attr if tab["active"] else curses.color_pair(CP_SESS)) | curses.A_BOLD)
+                if tab["id"] is not None and tw > 0:
+                    hits.append((li, x, x + tw - 1, ("tab", tab["id"])))
+        last = len(plan["lines"]) - 1
+        if plan["left"]:
+            put(stdscr, 0, plan["left"][1], plan["left"][0], C_MORE | curses.A_BOLD)
+        if plan["right"]:
+            put(stdscr, last, plan["right"][1], plan["right"][0], C_MORE | curses.A_BOLD)
+
+    # 토글 — 접힘/펼침 모두 0행 오른쪽 끝 (같은 자리)
+    tx = w - TOGGLE_W
+    if tx >= 0:
+        put(stdscr, 0, tx, " ▾ " if rows == 1 else " ▴ ", curses.color_pair(CP_BTN) | curses.A_BOLD)
+        hits.append((0, tx, w - 1, ("toggle", None)))
+
+    if h >= 2:
+        if rows == 1:
+            draw_toolbar(stdscr, 1, hits)
+        else:
+            draw_icons(stdscr, 1, hits)
+    stdscr.refresh()
+
+
+# ── 메인 루프 ──────────────────────────────────────────────────────────────
+
+def init_colors() -> None:
     curses.start_color()
     curses.use_default_colors()
+    curses.init_pair(CP_LOGO,   curses.COLOR_GREEN,  -1)                  # logo
+    curses.init_pair(CP_SEP,    8,                   -1)                  # separator (dim gray)
+    curses.init_pair(CP_BTN,    curses.COLOR_CYAN,   -1)                  # buttons · 토글
+    curses.init_pair(CP_SESS,   curses.COLOR_YELLOW, -1)                  # session name · 벨 *
+    curses.init_pair(CP_ACTIVE, curses.COLOR_BLACK,  curses.COLOR_CYAN)   # 활성 탭 (색 반전 + 굵게)
+    curses.init_pair(CP_MORE,   8,                   -1)                  # … ‹N N› (dim gray)
 
-    # Colors
-    curses.init_pair(1, curses.COLOR_GREEN,  -1)   # logo
-    curses.init_pair(2, 8,                   -1)   # separator (dim gray)
-    curses.init_pair(3, curses.COLOR_CYAN,   -1)   # buttons
-    curses.init_pair(4, curses.COLOR_YELLOW, -1)   # session name
 
-    # Enable mouse (all events)
-    curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+def run_hit(act, source: TabSource, state_file: str):
+    """눌린 항목 실행. 새 토글 값(1|2)을 바꿨으면 그 값, 아니면 None."""
+    kind, arg = act
+    if kind in ("tab", "toggle") or (kind == "action" and arg != "picker"):
+        restore_focus()                           # 마우스 클릭이 바 pane에 남긴 포커스를 본문으로 (탭 전환 전에!)
+    if kind == "action":
+        do_action(arg)
+    elif kind == "toggle":
+        return toggle_rows(state_file)
+    elif kind == "tab":
+        proc = zellij_action("go-to-tab-by-id", str(arg))
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        if source is not None:
+            source.refresh_now()                  # 활성 표시가 다음 주기를 기다리지 않게
+    elif kind == "nav":
+        zellij_action(arg)
+    return None
 
-    stdscr.timeout(5000)  # refresh every 5s (picks up resize, session name changes)
 
-    btn_ranges: list = []  # (start_col, end_col, action)
+def bar_main(stdscr) -> None:
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    init_colors()
+    curses.mousemask(MOUSE_MASK)
 
-    while True:
-        draw(stdscr, btn_ranges)
+    stdscr.timeout(POLL_MS)
 
-        k = stdscr.getch()
+    t0 = time.monotonic()
+    sfile = state_path()
+    source = None                     # 스트립 모드에서 처음 필요할 때 만든다 (레거시 모드는 캐시 디렉터리도 만들지 않는다)
+    rows = read_rows(sfile)
+    hits: list = []
+    last_sig = None
+    next_force = 0.0
+    last_wheel = 0.0
 
-        if k == -1:
-            continue  # timeout → redraw
+    try:
+        while True:
+            h, w = stdscr.getmaxyx()
+            now = time.monotonic()
+            elapsed = now - t0
 
-        if k == ord("p"):
-            do_action("picker")
-        elif k == ord("x"):
-            do_action("close")
-        elif k in (ord("q"), ord("Q")):
-            do_action("quit")
-        elif k == curses.KEY_MOUSE:
+            if h < 2:
+                # 레거시 모드 — 옛 레이아웃: 위에 네이티브 tab-bar가 있다. 툴바 1행만, zellij 호출·공유 상태 없음.
+                sig = ("legacy", h, w)
+                if sig != last_sig or now >= next_force:
+                    draw_legacy(stdscr, hits)
+                    last_sig, next_force = sig, now + 5
+            else:
+                rows = read_rows(sfile)
+                if source is None:
+                    source = TabSource(SESSION, cache_dir_path())
+                try:
+                    source.poll(elapsed)
+                except Exception:  # 상태 표시줄은 예기치 않은 I/O 오류로 죽지 않는다 — 마지막 탭 목록으로 계속
+                    pass
+                tabs = source.tabs
+                placeholder = tabs is None
+                sig = ("strip", h, w, rows, placeholder, tabs)
+                if sig != last_sig or now >= next_force:
+                    draw_strip(stdscr, rows, tabs, placeholder, hits)
+                    last_sig, next_force = sig, now + 5
+
+            k = stdscr.getch()
+            if k == -1:
+                continue  # timeout → 상태 확인 후 다시
+
+            key_act = classify_key(k)
+            if key_act is not None:
+                if key_act[0] == "toggle":
+                    if h >= 2:
+                        toggle_rows(sfile)
+                        last_sig = None
+                else:
+                    do_action(key_act[1])
+            elif k == curses.KEY_MOUSE:
+                try:
+                    _, mx, my, _, bstate = curses.getmouse()
+                except curses.error:
+                    continue
+                act = classify_mouse(bstate, mx, my, hits)
+                if act is None:
+                    continue
+                if act[0] == "nav":
+                    if time.monotonic() - last_wheel < WHEEL_THROTTLE:
+                        continue
+                    last_wheel = time.monotonic()
+                if h < 2 and act[0] != "action":
+                    continue
+                run_hit(act, source, sfile)
+                last_sig = None
+            elif k == curses.KEY_RESIZE:
+                last_sig = None  # 다음 반복에서 다시 그림
+    finally:
+        if source is not None:
+            source.close()
+
+
+def setup_locale() -> None:
+    """한글 등 넓은 글자를 curses가 그리려면 UTF-8 로케일이 필요하다 (initscr 전에)."""
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    if locale.nl_langinfo(locale.CODESET).upper().replace("-", "") != "UTF8":
+        for loc in ("en_US.UTF-8", "C.UTF-8", "UTF-8"):
             try:
-                _, mx, my, _, _ = curses.getmouse()
-                if my == 0:
-                    for start, end, action in btn_ranges:
-                        if start <= mx <= end:
-                            do_action(action)
-                            break
-            except curses.error:
-                pass
-        elif k == curses.KEY_RESIZE:
-            pass  # just redraw on next iteration
+                locale.setlocale(locale.LC_ALL, loc)
+                break
+            except locale.Error:
+                continue
 
 
 def main() -> None:
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    setup_locale()
     curses.wrapper(bar_main)
 
 

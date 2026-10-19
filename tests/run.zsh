@@ -34,7 +34,7 @@ if [[ -n "$CMUX_UNDER_TEST" && "${CMUX_UNDER_TEST:A}" != "$REPO/bin/cmux" ]]; th
   done
 fi
 sh -n "$REPO/tests/bin/fake-agent" || syntax_rc=1
-for f in "$REPO/tests/lib/ptyrun.py" "$REPO/bin/cmux-bar"; do
+for f in "$REPO/tests/lib/ptyrun.py" "$REPO/bin/cmux-bar" "$REPO/tests/unit/t06_cmux_bar_check.py"; do
   python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$f" || syntax_rc=1
 done
 _record "구문검사 (zsh -n / sh -n / python ast)" $syntax_rc

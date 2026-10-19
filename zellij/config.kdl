@@ -2,6 +2,11 @@
 // Docs: https://zellij.dev/documentation/
 
 mouse_mode true
+
+// 포커스 없는 pane을 클릭하면 그 클릭도 pane 안으로 보낸다 (기본 false = 첫 클릭은 포커스 이동에만 쓰이고 앱에 안 전달됨).
+// cmux-bar(상단 탭 줄)의 탭 이름·토글·버튼이 첫 클릭에 동작하려면 필요하다. 서버 시작 때만 읽힌다 —
+// 이미 떠 있는 세션에는 적용되지 않으므로 cmux -k 등으로 세션을 새로 만든 뒤부터 유효하다.
+mouse_click_through true
 scroll_buffer_size 10000
 copy_on_select true
 

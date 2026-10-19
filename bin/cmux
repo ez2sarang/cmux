@@ -431,25 +431,33 @@ _kdl_tab() {
   print -r -- "    }"
 }
 
-# _kdl_tab_layout <에이전트> — new-tab 전용 탭 레이아웃 (claude-tab.kdl.tmpl과 같은 구조: 탭바·cmux-bar·본문·상태바).
+# _bar_pane <들여쓰기> — 상단 바 pane KDL. cmux-bar가 있으면 직접 그리는 탭 줄+툴바(내용 2행 = size=3, 탭 줄 1↔2줄 토글;
+# zellij 0.45.1은 터미널 pane의 마지막 한 행을 쓸 수 없고 1행 pane은 렌더링하지 않는다. 상단 총 3행),
+# 없으면 네이티브 zellij:tab-bar 플러그인(size=1)으로 폴백한다. claude-*.kdl.tmpl과 같은 규칙.
+_bar_pane() {
+  local ind="$1"
+  if [[ -n "$CMUX_BAR_BIN" && -x "$CMUX_BAR_BIN" ]]; then
+    print -r -- "${ind}pane size=3 borderless=true {
+${ind}    command \"/bin/zsh\"
+${ind}    args \"-c\" \"while true; do ${CMUX_BAR_BIN}; sleep 1; done\"
+${ind}}"
+  else
+    print -r -- "${ind}pane size=1 borderless=true {
+${ind}    plugin location=\"zellij:tab-bar\"
+${ind}}"
+  fi
+}
+
+# _kdl_tab_layout <에이전트> — new-tab 전용 탭 레이아웃 (claude-tab.kdl.tmpl과 같은 구조: cmux-bar(없으면 탭바)·본문·상태바).
 # new-tab -l 은 세션 default_tab_template을 적용하지 않으므로 바들을 직접 포함한다. 에이전트 인자만 다르다.
 _kdl_tab_layout() {
-  local bar_block=""
-  if [[ -n "$CMUX_BAR_BIN" && -x "$CMUX_BAR_BIN" ]]; then
-    # zellij 0.45.1은 1행 터미널 pane을 렌더링하지 않으므로 2행 (내용 1행 + 아래 pane 프레임 행)
-    bar_block="
-    pane size=2 borderless=true {
-        command \"/bin/zsh\"
-        args \"-c\" \"while true; do ${CMUX_BAR_BIN}; sleep 1; done\"
-    }"
-  fi
+  local bar_block
+  bar_block="$(_bar_pane "    ")"
   local -a body=("${(@f)$(_kdl_tab_body "${1:-claude}")}")
 
   cat <<KDL
 layout {
-    pane size=1 borderless=true {
-        plugin location="zellij:tab-bar"
-    }${bar_block}
+${bar_block}
 ${(F)${(@)body/#/    }}
     pane size=2 borderless=true {
         plugin location="zellij:status-bar"
@@ -482,21 +490,12 @@ _make_layout() {
   local tmpfile="$SESSION_LAYOUT_FILE"
   mkdir -p "$ZELLIJ_LAYOUTS_DIR"
 
-  local bar_block=""
-  if [[ -n "$CMUX_BAR_BIN" && -x "$CMUX_BAR_BIN" ]]; then
-    # zellij 0.45.1은 1행 터미널 pane을 렌더링하지 않으므로 2행 (내용 1행 + 아래 pane 프레임 행)
-    bar_block="        pane size=2 borderless=true {
-            command \"/bin/zsh\"
-            args \"-c\" \"while true; do ${CMUX_BAR_BIN}; sleep 1; done\"
-        }"
-  fi
+  local bar_block
+  bar_block="$(_bar_pane "        ")"
 
   cat > "$tmpfile" <<HEADER
 layout {
     default_tab_template {
-        pane size=1 borderless=true {
-            plugin location="zellij:tab-bar"
-        }
 ${bar_block}
         children
         pane size=2 borderless=true {

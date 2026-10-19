@@ -101,6 +101,22 @@ cmux kill            # 세션 종료만 (탭 기록 보존 → 다음 cmux가 �
 | `Enter` | 열기 |
 | `Esc` / `q` | 취소 |
 
+### 상단 탭 줄 (1줄 ↔ 2줄 토글)
+
+상단 3행은 `cmux-bar`가 직접 그립니다(zellij 기본 `tab-bar` 플러그인은 1줄 전용이라 쓰지 않음). 높이는 항상 3행이고, 안에서 모양만 바뀝니다.
+
+| 상태 | 0행 | 1행 |
+|------|-----|-----|
+| 접힘(기본) | 탭 1줄 + 오른쪽 끝 `▾` | 툴바(`cmux │ ◉ Picker │ × Close │ ⏻ Quit │ … 세션명`) |
+| 펼침 | 탭 줄 + 오른쪽 끝 `▴` | 탭 줄 이어서 + 오른쪽 끝 축약 아이콘 `◉ │ × │ ⏻` |
+
+- 토글: `▾`/`▴` 클릭 또는 바 pane에서 `t` 키. 상태는 `~/.config/cmux/tabbar-rows`(`1` 또는 `2`, 환경변수 `CMUX_TABBAR_STATE_FILE`)에 저장돼 **모든 탭의 바가 0.5초 안에 함께 바뀝니다**(재시작 불필요).
+- 탭 이름 클릭 = 그 탭으로 이동, 마우스 휠 위 = 이전 탭. **휠 아래(다음 탭)는 이 머신의 `python3`(`/usr/bin/python3` → Xcode 의 Python 3.9.6, ncurses 6.0 마우스 버전 1 빌드)에 `BUTTON5_PRESSED`가 없어 동작하지 않습니다**(`tests/integration/t08_tabbar_real_click.zsh`에서 휠 위는 이전 탭으로 이동, 휠 아래는 활성 탭 그대로임을 실측; 탭 이름 클릭이나 휠 위로 이동). 이름은 14칸에서 `…`로 자르고(한글 2칸 계산), 벨 알림 탭은 `*`. 다 안 들어가면 활성 탭이 보이는 창만 그리고 가장자리에 숨은 개수(`‹3` `4›`)를 표시합니다.
+- **바 pane의 키는 `p`(피커)와 `t`(토글)뿐입니다. `x`(탭 닫기)·`q`(세션 종료) 키는 일부러 없앴습니다** — Close/Quit은 `× Close`·`⏻ Quit` 버튼 클릭으로만 합니다. 클릭한 바는 자기 탭의 본문(에이전트) pane으로 포커스를 돌려놓습니다(탭 전환 전에 수행; Picker 클릭은 새 floating pane이 포커스를 가져가므로 제외). 포커스를 바에 남겨 두면 나중에 그 탭에서 친 키가 바로 들어가기 때문입니다. (이동은 `focus-next-pane` 반복 — zellij 0.45.1의 `focus-pane-id`는 `mouse_click_through true`에서 클릭이 준 키보드 포커스를 옮기지 못함을 실측.)
+- 첫 클릭부터 동작하려면 zellij `mouse_click_through true`가 필요합니다(레포 `zellij/config.kdl`에 포함; 서버 시작 때만 읽힘 → 이미 떠 있는 세션은 `cmux -k` 후부터, 사용자 `~/.config/zellij/config.kdl`에는 직접 병합). 이 설정이 없으면 포커스 없는 pane의 첫 클릭은 포커스 이동에만 쓰이고 탭 이동은 두 번 클릭해야 합니다.
+- 탭 목록은 세션당 한 바(리더)만 1초마다 `zellij action list-tabs --json`으로 조회해 `$TMPDIR/cmux-bar-$UID/tabs-<세션>.json`(`CMUX_BAR_CACHE_DIR`)에 쓰고 나머지는 파일만 읽습니다. 바 시작 직후 2초 동안은 zellij CLI를 부르지 않으며(zellij 서버 초기화 충돌 회피), 그 사이 3초 미만의 신선한 캐시가 있으면 그 탭 목록을 바로 그리고 없으면 `…`만 그립니다.
+- **레거시 모드**: 바 pane의 내용이 1행뿐이면(옛 레이아웃으로 만든 탭 — 위에 네이티브 `tab-bar`가 따로 있음) 예전처럼 툴바 1행만 그립니다. 새 구조는 설치된 레이아웃을 다시 설치(`install.sh --force`)한 뒤 새로 만든 탭/세션부터 적용됩니다(`cmux`가 직접 만드는 세션·`cmux-tab-<에이전트>` 레이아웃은 즉시 새 구조).
+
 ### zellij 내 단축키
 
 | 키 | 동작 |
@@ -156,6 +172,7 @@ export CMUX_CLAUDE_BIN="/custom/path/to/claude"
 cmux/
 ├── bin/
 │   ├── cmux             # 메인 스크립트 (zsh)
+│   ├── cmux-bar         # 상단 탭 줄 + 툴바, 1↔2줄 토글 (Python curses)
 │   └── cmux-picker      # 커서 기반 피커 (Python)
 ├── zellij/
 │   ├── config.kdl        # zellij 메인 설정
