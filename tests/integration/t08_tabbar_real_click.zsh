@@ -4,6 +4,7 @@
 #   앱에 전달되지 않는 zellij 동작과 클릭이 남기는 포커스를 못 잡았다. 여기서는 ptyrun --send 로 zellij 클라이언트
 #   입력에 SGR 마우스 눌림+뗌을 보낸다 (= 터미널에서 실제로 클릭한 것과 같은 경로).
 #   A  mouse_click_through true  — 클릭 1회: 탭 전환 + 출발 탭 바 pane 포커스 해제·본문 pane 포커스 / 토글 버튼 클릭 + 포커스 복귀
+#      / 같은 바 재클릭(이동 횟수 캐시 적중 경로) + 포커스 복귀 · list-clients 실출력 형식 = 바 파서 전제
 #   B  mouse_click_through false — 클릭 1회: 전환 안 됨(바만 포커스) / 2회: 전환 + 출발 탭 본문 포커스 복귀
 #   K  x·q·X·Q 키를 바 pane에 보내도 세션·탭이 그대로 (p·t만 남김)
 #   W  휠 위/아래 (이 python의 curses에 BUTTON5가 있는지에 따라 아래 동작 여부를 고정)
@@ -117,6 +118,25 @@ for p in panes:
     if not p.get("is_plugin") and "cmux-bar" in ((p.get("terminal_command") or "") + (p.get("title") or "")) and p.get("tab_name") == sys.argv[1]:
         print("terminal_%d" % p["id"])' "$1"
 }
+_bodypane() {
+  _z action list-panes -a -j 2>/dev/null | python3 -I -c '
+import json, sys
+try:
+    panes = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for p in panes:
+    if not p.get("is_plugin") and p.get("title") == "claude" and p.get("tab_name") == sys.argv[1]:
+        print("terminal_%d" % p["id"])' "$1"
+}
+# list-clients 실출력을 cmux-bar의 parse_clients로 읽은 결과 (정렬, 쉼표 구분 / 판단 불가면 None)
+_parsed_clients() {
+  _z action list-clients 2>/dev/null | python3 -I -c '
+import importlib.machinery as m, importlib.util as u, sys
+l = m.SourceFileLoader("b", sys.argv[1]); s = u.spec_from_loader("b", l); b = u.module_from_spec(s); l.exec_module(b)
+r = b.parse_clients(sys.stdin.read())
+print("None" if r is None else ",".join(sorted(r)))' "$BAR_BIN"
+}
 _row() { _z action dump-screen --pane-id "$1" 2>/dev/null | sed -n "${2}p"; }
 _state() { cat "$CMUX_TABBAR_STATE_FILE" 2>/dev/null; }
 _report() { print -r -- "    [$1] 활성=$(_active_tab) 탭=$(_tabnames) alpha:{$(_focus alpha)} beta:{$(_focus beta)} 상태파일='$(_state)'"; }
@@ -132,11 +152,15 @@ t_assert_contains "zellij --config <레포 config> setup --check = Well defined 
 # ═══ A ═ click-through 켬 ═══════════════════════════════
 t_scenario A "mouse_click_through true: 진짜 클릭 1회에 탭 전환 + 포커스 복귀, 토글 클릭 + 포커스 복귀"
 A_START=$EPOCHSECONDS
-_start "$T_ROOT/cfg/zj-ct-true.kdl" "$(_click_arg 12 $BETA_X 1)" "$(_click_arg 18 $TOGGLE_X 1)" "$(_key_arg 26 t)"
+_start "$T_ROOT/cfg/zj-ct-true.kdl" "$(_click_arg 12 $BETA_X 1)" "$(_click_arg 18 $TOGGLE_X 1)" "$(_key_arg 26 t)" \
+  "$(_click_arg 32 $TOGGLE_X 1)" "$(_key_arg 40 t)"
 t_assert_true "세션 준비" 't_session_ready' 30
 t_assert_true "탭 3개 (alpha beta gamma)" '[[ "$(_tabnames)" == "alpha,beta,gamma" ]]' 30
 t_assert_true "시작: alpha 활성, 본문 pane 포커스·바 pane 포커스 없음" '[[ "$(_active_tab)" == alpha && "$(_focus alpha)" == "bar=False body=True" ]]' 30
 _report "클릭 전"
+# restore_focus의 포커스 확인(list-clients) 형식 전제: 실출력을 바의 파서가 읽고, 클라이언트(ptyrun 1개)의 포커스 = alpha 본문 pane
+print -r -- "    [list-clients 실출력] $(_z action list-clients 2>/dev/null | tr '\n' '|')"
+t_assert_eq "list-clients 실출력 → parse_clients = {alpha 본문 pane} (헤더 무시·형식 전제 확인)" "$(_bodypane alpha)" "$(_parsed_clients)"
 t_assert_true "바가 탭 줄을 그림 (클릭 12초 전에 준비)" '[[ "$(_row "$(_barpane alpha)" 1)" == *" beta "* ]]' 15
 # ① 클릭 1회 → 전환 + 출발 탭(alpha) 바 포커스 해제·본문 포커스
 t_assert_true "① 클릭 1회로 beta로 전환 (click-through)" '[[ "$(_active_tab)" == beta ]]' 40
@@ -151,6 +175,12 @@ _report "③ 토글 클릭 후"
 # 실제 키 입력: 26초에 클라이언트로 t를 보낸다. 바가 포커스를 갖고 있으면 상태가 다시 1로 뒤집힌다 → 2 그대로여야 한다
 t_wait_for '(( EPOCHSECONDS - A_START >= 30 ))' 45
 t_assert_true "③ 26초 키 t 이후에도 상태 파일 = 2 (키가 바가 아닌 본문 pane으로 감 = 클릭 뒤 포커스 복귀의 실제 키 증거)" '[[ "$(_state)" == 2 ]]'
+# ④ 같은 바(beta)를 다시 클릭(32초) — 이 바 프로세스는 ③에서 이동 횟수를 기억했다 → list-panes 없는 캐시 적중 경로
+t_assert_true "④ 같은 바 토글 재클릭 → 상태 파일 = 1" '[[ "$(_state)" == 1 ]]' 30
+t_assert_true "④ 재클릭 뒤 beta 포커스 복귀 (바 해제·본문)" '[[ "$(_focus beta)" == "bar=False body=True" ]]' 10
+_report "④ 토글 재클릭 후"
+t_wait_for '(( EPOCHSECONDS - A_START >= 44 ))' 60
+t_assert_true "④ 40초 키 t 이후에도 상태 파일 = 1 (캐시 경로에서도 키보드 포커스가 본문으로 감)" '[[ "$(_state)" == 1 ]]'
 _stop_session
 
 # ═══ B ═ click-through 끔 ═══════════════════════════════

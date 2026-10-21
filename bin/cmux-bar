@@ -417,6 +417,11 @@ def pick_focus_target(panes, my_id):
     me = _my_pane(panes, my_id)
     if me is None or not me.get("is_focused"):
         return None
+    return _body_target(panes, me)
+
+
+def _body_target(panes, me):
+    """pick_focus_target의 후보 규칙 — 자기 pane 항목 me의 포커스 여부는 보지 않는다 (이미 포커스를 옮긴 뒤의 교정용)."""
     me_id = me["id"]
     panes = [p for p in panes if isinstance(p, dict)]
     cands = [
@@ -446,41 +451,160 @@ def _focused_ids(panes, me) -> set:
             and p.get("tab_id") == me.get("tab_id") and p.get("is_focused")}
 
 
+def parse_clients(text):
+    """`zellij action list-clients` 출력 → 클라이언트들이 포커스한 pane 이름 집합 {"terminal_3", "plugin_2", …}.
+
+    형식(zellij 0.45.1): 헤더 `CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND` + 클라이언트마다 `1  terminal_3  zsh …`.
+    헤더는 건너뛰고 공백으로 나눈다(클라이언트 여러 개 허용). 행이 없거나 형식이 다르면 None(판단 불가).
+    """
+    if not isinstance(text, str):
+        return None
+    rows = [line.split() for line in text.splitlines() if line.strip()]
+    if rows and rows[0][0] == "CLIENT_ID":
+        rows = rows[1:]
+    if not rows:
+        return None
+    for r in rows:
+        if len(r) < 2 or not re.fullmatch(r"[0-9]+", r[0]) or not re.fullmatch(r"(?:terminal|plugin)_[0-9]+", r[1]):
+            return None
+    return {r[1] for r in rows}
+
+
+def _client_focus(pane_id: int):
+    """터미널 pane pane_id가 어느 클라이언트에서든 포커스인가 — list-clients(약 100B, list-panes는 100KB대)로 본다.
+
+    True/False. 호출 실패·시간 초과·형식 이상이면 None(판단 불가).
+    """
+    try:
+        cp = subprocess.run(
+            ["zellij", "action", "list-clients"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=LIST_TABS_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if cp.returncode != 0:
+        return None
+    focused = parse_clients((cp.stdout or b"").decode("utf-8", "replace"))
+    if focused is None:
+        return None
+    return "terminal_%d" % pane_id in focused
+
+
+def _list_panes():
+    return _zellij_json(["list-panes", "--json", "--all"], LIST_TABS_TIMEOUT)
+
+
+def _tab_pane_count(panes, me) -> int:
+    """focus-next-pane 반복 상한 = 내 탭의 터미널 pane 수 (최소 1)."""
+    return max(1, sum(1 for p in panes if isinstance(p, dict) and not p.get("is_plugin") and p.get("tab_id") == me.get("tab_id")))
+
+
+# 이 바 프로세스가 마지막으로 성공한 포커스 복귀: (목표 pane id, 바에서 목표까지 focus-next-pane 횟수). 없으면 None.
+# 바 pane은 자기 탭에 붙어 있으므로 탭 구분은 필요 없다. 낡으면(pane 분할·닫힘) 검증에서 걸러 버리고 list-panes로 교정한다.
+_focus_plan = None
+
+
 def restore_focus() -> None:
     """클릭 처리 전에 자기 탭의 본문 pane으로 포커스를 돌려놓는다 (탭 전환 전에 해야 한다 — 전환 뒤엔 늦다).
 
     zellij는 포커스 없는 터미널 pane을 클릭하면 그 pane에 포커스를 준다. 이 포커스를 남겨 두면 나중에 그 탭으로
     돌아와 친 키가 바에 간다. 실패해도 본 동작은 막지 않는다.
 
-    이동은 `focus-next-pane`을 목표 pane이 포커스될 때까지(최대 pane 수만큼) 반복한다. 실측(zellij 0.45.1):
-    `focus-pane-id`는 mouse_click_through가 켜진 상태에서 클릭이 준 포커스를 바꾸지 못한다 — 실제 키보드 포커스는 바에
-    남고 list-panes에 두 pane이 동시에 focused로 보인다. `focus-next-pane`은 두 설정 모두에서 키보드 포커스를 옮긴다.
+    이동은 `focus-next-pane` 반복이다. 실측(zellij 0.45.1): `focus-pane-id`는 mouse_click_through가 켜진 상태에서 클릭이
+    준 포커스를 바꾸지 못한다 — 실제 키보드 포커스는 바에 남고 list-panes에 두 pane이 동시에 focused로 보인다.
+    `focus-next-pane`은 두 설정 모두에서 키보드 포커스를 옮긴다.
+
+    클릭 지연을 줄이려고 포커스 확인은 작은 list-clients로 한다 (탭 전환은 이 함수가 끝난 뒤라 여기 호출이 곧 클릭 지연):
+      1. 자기 pane이 포커스인가 (아직이면 FOCUS_WAIT까지 재확인, 끝내 아니면 아무것도 안 함)
+      2. 캐시 적중: 기억한 횟수만큼 focus-next-pane → list-clients 1회로 목표 포커스 확인 (list-panes 0회)
+         캐시 미스: list-panes 1회로 목표를 구하고, focus-next-pane 1회마다 list-clients로 확인 → 성공 횟수를 기억
+      3. 확인이 틀리거나 판단 불가면 캐시를 버리고 list-panes로 교정(기존 per-step 루프).
+         처음부터 list-clients를 판단할 수 없으면 기존 경로(list-panes만 사용) 그대로.
     """
-    if not MY_PANE_ID:
+    global _focus_plan
+    try:
+        me_id = int(MY_PANE_ID)
+    except ValueError:
         return
     try:
         deadline = time.monotonic() + FOCUS_WAIT
-        while True:
-            panes = _zellij_json(["list-panes", "--json", "--all"], LIST_TABS_TIMEOUT)
-            target = pick_focus_target(panes, MY_PANE_ID)
-            if target is not None:
-                break
-            # mouse_click_through 가 켜져 있으면 클릭이 앱에 전달된 "뒤에" 포커스가 옮겨 올 수 있다 →
-            # 자기 pane이 아직 포커스가 없을 때만 잠깐 기다린다. 끝내 포커스가 없으면 아무것도 하지 않는다.
-            me = _my_pane(panes, MY_PANE_ID)
-            if me is None or me.get("is_focused") or time.monotonic() >= deadline:
-                return
+        mine = _client_focus(me_id)
+        while mine is False and time.monotonic() < deadline:
+            # mouse_click_through 가 켜져 있으면 클릭이 앱에 전달된 "뒤에" 포커스가 옮겨 올 수 있다 → 잠깐 기다린다
             time.sleep(0.1)
-        me = _my_pane(panes, MY_PANE_ID)
-        steps = sum(1 for p in panes if isinstance(p, dict) and not p.get("is_plugin") and p.get("tab_id") == me.get("tab_id"))
-        for _ in range(max(steps, 1)):
-            _run_zellij_action("focus-next-pane")
-            panes = _zellij_json(["list-panes", "--json", "--all"], LIST_TABS_TIMEOUT)
-            me = _my_pane(panes, MY_PANE_ID)
-            if me is None or target in _focused_ids(panes, me):
+            mine = _client_focus(me_id)
+        if mine is None:
+            _restore_focus_by_panes()
+            return
+        if not mine:
+            return
+        if _focus_plan is not None:
+            target, steps = _focus_plan
+            for _ in range(steps):
+                _run_zellij_action("focus-next-pane")
+            if _client_focus(target):
                 return
+            _focus_plan = None
+            _resume_by_panes()
+            return
+        panes = _list_panes()
+        target = pick_focus_target(panes, me_id)
+        if target is None:
+            _restore_focus_by_panes(panes)
+            return
+        for n in range(1, _tab_pane_count(panes, _my_pane(panes, me_id)) + 1):
+            _run_zellij_action("focus-next-pane")
+            hit = _client_focus(target)
+            if hit:
+                _focus_plan = (target, n)
+                return
+            if hit is None:
+                break
+        _resume_by_panes()
     except Exception:  # noqa: BLE001 — 포커스 복귀 실패가 클릭 동작을 막으면 안 된다
         pass
+
+
+def _restore_focus_by_panes(panes=None) -> None:
+    """기존 경로 (list-panes만 사용): 자기 pane 포커스를 FOCUS_WAIT까지 기다린 뒤 per-step 루프. panes가 있으면 첫 조회로 쓴다."""
+    deadline = time.monotonic() + FOCUS_WAIT
+    while True:
+        if panes is None:
+            panes = _list_panes()
+        target = pick_focus_target(panes, MY_PANE_ID)
+        if target is not None:
+            break
+        me = _my_pane(panes, MY_PANE_ID)
+        if me is None or me.get("is_focused") or time.monotonic() >= deadline:
+            return
+        time.sleep(0.1)
+        panes = None
+    _step_by_panes(panes, target)
+
+
+def _resume_by_panes() -> None:
+    """빠른 경로가 목표에 못 닿았거나 확인할 수 없을 때: list-panes로 목표를 다시 구해, 이미 포커스면 그대로 두고 아니면
+    지금 위치에서 per-step 루프를 잇는다 (자기 pane은 이미 포커스를 넘겼을 수 있어 포커스 여부는 보지 않는다)."""
+    panes = _list_panes()
+    me = _my_pane(panes, MY_PANE_ID)
+    if me is None:
+        return
+    target = _body_target(panes, me)
+    if target is None or target in _focused_ids(panes, me):
+        return
+    _step_by_panes(panes, target)
+
+
+def _step_by_panes(panes, target) -> None:
+    """기존 per-step 루프: focus-next-pane 1회마다 list-panes로 확인, 목표가 포커스되면 멈춘다 (최대 탭의 터미널 pane 수)."""
+    me = _my_pane(panes, MY_PANE_ID)
+    for _ in range(_tab_pane_count(panes, me)):
+        _run_zellij_action("focus-next-pane")
+        panes = _list_panes()
+        me = _my_pane(panes, MY_PANE_ID)
+        if me is None or target in _focused_ids(panes, me):
+            return
 
 
 class TabSource:
@@ -583,6 +707,35 @@ class TabSource:
     def refresh_now(self) -> bool:
         """탭 이동 직후 등 즉시 갱신 (리더가 아니어도 한 번 조회해 캐시를 갱신한다)."""
         return self._refresh(time.time(), self.is_leader)
+
+    def mark_active(self, tab_id) -> bool:
+        """탭 이동 성공 직후의 낙관적 갱신 — list-tabs를 부르지 않고 캐시 파일 탭 목록의 활성 표시만 tab_id 탭으로 바꿔
+        원자적으로 다시 쓴다 (다른 탭의 바들이 다음 입력 대기 주기 안에 읽는다). 리더의 다음 list-tabs(1초 주기)가 진실로 교정한다.
+
+        캐시 쓰기는 refresh_now(팔로워도 쓴다)와 같은 규약이다: write_atomic, 락·pid 파일은 건드리지 않고, 자기 쓰기의
+        sig를 기억해 다시 읽지 않는다. 캐시를 못 읽거나 쓰지 못하거나 그 탭이 목록에 없으면 False (호출자가 refresh_now로 폴백).
+        """
+        if not self.usable:
+            return False
+        try:
+            with open(self.cache_file, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(raw, list) or not any(isinstance(t, dict) and t.get("tab_id") == tab_id for t in raw):
+            return False
+        for t in raw:
+            if isinstance(t, dict):
+                t["active"] = t.get("tab_id") == tab_id
+        if not write_atomic(self.cache_file, json.dumps(raw, ensure_ascii=False)):
+            return False
+        try:
+            st = os.stat(self.cache_file)
+            self._sig = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            self._sig = None
+        self.tabs = normalize_tabs(raw)
+        return True
 
     def close(self) -> None:
         """리더면 락을 반납한다 (내 pid일 때만)."""
@@ -807,11 +960,12 @@ def run_hit(act, source: TabSource, state_file: str):
     elif kind == "tab":
         proc = zellij_action("go-to-tab-by-id", str(arg))
         try:
-            proc.wait(timeout=2)
+            rc = proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            pass
-        if source is not None:
-            source.refresh_now()                  # 활성 표시가 다음 주기를 기다리지 않게
+            rc = None
+        # 활성 표시가 리더의 다음 조회를 기다리지 않게: 이동 성공이면 캐시만 고쳐 쓰고(list-tabs 없음), 아니면 한 번 조회
+        if source is not None and not (rc == 0 and source.mark_active(arg)):
+            source.refresh_now()
     elif kind == "nav":
         zellij_action(arg)
     return None

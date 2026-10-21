@@ -30,6 +30,32 @@ def load(path, name):
 bar = load(BAR_PATH, "cmux_bar_under_test")
 curses.color_pair = lambda n: n << 8          # initscr/start_color 없이 속성 값만 만든다 (신·구 모듈 공용)
 
+# 안전장치: 이 시험은 실제 zellij를 절대 부르지 않는다. ZELLIJ* env가 없어도 세션이 하나뿐이면 `zellij action`이 그 세션
+# (사용자 라이브 세션일 수 있음)을 겨냥하므로, 가짜로 바꾸지 않은 경로가 zellij를 부르면 막고 기록한다 (끝에서 0건 단언).
+REAL_ZELLIJ = []
+_sp_run, _sp_popen = subprocess.run, subprocess.Popen
+
+
+def _is_zellij(cmd):
+    return isinstance(cmd, (list, tuple)) and bool(cmd) and os.path.basename(str(cmd[0])) == "zellij"
+
+
+def _guard_run(cmd, *a, **kw):
+    if _is_zellij(cmd):
+        REAL_ZELLIJ.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 1, b"", b"")
+    return _sp_run(cmd, *a, **kw)
+
+
+def _guard_popen(cmd, *a, **kw):
+    if _is_zellij(cmd):
+        REAL_ZELLIJ.append(list(cmd))
+        cmd = ["/usr/bin/false"]
+    return _sp_popen(cmd, *a, **kw)
+
+
+subprocess.run, subprocess.Popen = _guard_run, _guard_popen
+
 
 def scenario(sid, desc):
     print("SCENARIO\t%s\t%s" % (sid, desc))
@@ -625,66 +651,289 @@ excluded = [BASE[0], pane(20, "claude", 0, 2, floating=True), pane(21, "claude",
 eq("플로팅·selectable 아님·숨김·플러그인 pane은 제외 → 남은 files", 24, bar.pick_focus_target(excluded, "5"))
 eq("같은 y면 x가 작은 쪽", 31, bar.pick_focus_target([BASE[0], pane(30, "files", 60, 4), pane(31, "files", 10, 4)], "5"))
 
-# restore_focus: focus-next-pane을 목표 pane이 포커스될 때까지 반복 (focus-pane-id는 click-through에서 실제 포커스를 못 옮김, 실측)
+# restore_focus: focus-next-pane 반복으로 목표 pane에 포커스 (focus-pane-id는 click-through에서 실제 포커스를 못 옮김, 실측)
+# 포커스 확인은 list-clients(작은 응답), 목표·이동 횟수는 바 프로세스 메모리 캐시 — 캐시 미스일 때만 list-panes(큰 응답) 1회.
 # 클릭 직후 자기 pane이 아직 포커스가 없으면 기다렸다가 복귀 / 끝내 없으면 아무것도 안 함
-class FakeZellij:
-    """탭 하나의 pane 고리 [(id, title, x, y)] 와 포커스 인덱스를 가진 가짜 zellij."""
+scenario("F2", "restore_focus 호출 순서 — list-clients 확인 · 이동 횟수 캐시 · 검증 실패/판단 불가 폴백 · A3 낙관적 갱신")
+LC_HEADER = "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n"
 
-    def __init__(self, ring, focus_idx, focus_after_polls=0):
-        self.ring, self.idx, self.polls, self.focus_after = ring, focus_idx, 0, focus_after_polls
-        self.actions = []
+
+class FakeZellij:
+    """가짜 zellij — 탭 하나의 pane 고리 [(id, title, x, y)] (= focus-next-pane 순서) 와 포커스 인덱스.
+
+    calls: 부른 zellij 명령 이름 순서. 바 = id 5.
+    focus_after: 바가 클릭 포커스를 받기 전까지의 포커스 조회(list-panes·list-clients) 횟수 — 그동안 포커스는 pre(본문) pane.
+    clients: list-clients 응답 각본(호출마다 하나씩, 다 쓰면 "ok"): ok | fail(종료코드 1) | timeout | garbage | header(헤더만)
+    panes_fail: list-panes 조회 실패(None).  goto_rc: go-to-tab-by-id 종료코드(정수) 또는 "timeout".
+    """
+
+    def __init__(self, ring, focus_idx, focus_after=0, pre=7, clients=(), panes_fail=False, goto_rc=0, raw_tabs=None):
+        self.ring, self.idx = list(ring), focus_idx
+        self.focus_after, self.pre, self.queries = focus_after, pre, 0
+        self.clients, self.panes_fail, self.goto_rc, self.raw_tabs = list(clients), panes_fail, goto_rc, raw_tabs
+        self.calls = []
+
+    def focused_id(self):
+        pid = self.ring[self.idx][0]
+        return self.pre if (pid == 5 and self.queries <= self.focus_after) else pid
 
     def json(self, args, timeout):
-        self.polls += 1
-        out = []
-        for i, (pid, title, x, y) in enumerate(self.ring):
-            foc = (i == self.idx) and not (pid == 5 and self.polls <= self.focus_after)
-            out.append(pane(pid, title, x, y, focused=foc))
-        return out
+        self.calls.append(args[0])
+        self.queries += 1
+        if self.panes_fail:
+            return None
+        foc = self.focused_id()
+        return [pane(pid, title, x, y, focused=(pid == foc)) for pid, title, x, y in self.ring]
 
     def run(self, cmd, **kw):
-        self.actions.append(cmd[2:])
-        if cmd[2:] == ["focus-next-pane"]:
+        act = cmd[2] if len(cmd) > 2 else "?"
+        self.calls.append(act)
+        if act == "focus-next-pane":
             self.idx = (self.idx + 1) % len(self.ring)
+            return subprocess.CompletedProcess(cmd, 0)
+        if act == "list-clients":
+            self.queries += 1
+            mode = self.clients.pop(0) if self.clients else "ok"
+            if mode == "timeout":
+                raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+            out = {"ok": LC_HEADER + "1          terminal_%d      /bin/sleep 600\n" % self.focused_id(),
+                   "fail": "", "garbage": "Error: no such action\n", "header": LC_HEADER}[mode]
+            return subprocess.CompletedProcess(cmd, 1 if mode == "fail" else 0, out.encode(), b"")
+        self.calls[-1] = "UNEXPECTED:" + act
+        return subprocess.CompletedProcess(cmd, 1)
+
+    def popen(self, *args):
+        self.calls.append(args[0])
+        rc = self.goto_rc
+
+        class P:
+            def wait(self, timeout=None):
+                if rc == "timeout":
+                    raise subprocess.TimeoutExpired(["zellij"], timeout)
+                return rc
+        return P()
+
+    def fetch_tabs(self):
+        self.calls.append("list-tabs")
+        return self.raw_tabs
+
+    def focus(self):
+        return self.ring[self.idx][0]
+
+    def n(self, name):
+        return self.calls.count(name)
 
 
-real_json, real_run = bar._zellij_json, bar.subprocess.run
+real_json, real_run, real_zaction = bar._zellij_json, bar.subprocess.run, bar.zellij_action
 bar.MY_PANE_ID, bar.FOCUS_WAIT = "5", 2.0
 
 
-def run_restore(fz):
-    bar._zellij_json, bar.subprocess.run = fz.json, fz.run
+def patched(fz, fn, *a):
+    bar._zellij_json, bar.subprocess.run, bar.zellij_action = fz.json, fz.run, fz.popen
     try:
-        bar.restore_focus()
+        return fn(*a)
     finally:
-        bar._zellij_json, bar.subprocess.run = real_json, real_run
+        bar._zellij_json, bar.subprocess.run, bar.zellij_action = real_json, real_run, real_zaction
 
 
-fz = FakeZellij([(5, "bar", 0, 1), (7, "claude", 0, 4), (8, "files", 122, 4), (6, "terminal", 122, 27)], 0)
+def run_restore(fz, plan="keep"):
+    if plan != "keep":
+        bar._focus_plan = plan
+    patched(fz, bar.restore_focus)
+
+
+LC, LP, FNP, GOTO, LT = "list-clients", "list-panes", "focus-next-pane", "go-to-tab-by-id", "list-tabs"
+# cmux 기본 레이아웃 순서 (zellij focus-next-pane = 위→아래·왼→오른): 바 → claude → files → terminal
+RING = [(5, "bar", 0, 0), (7, "claude", 0, 3), (8, "files", 130, 3), (6, "terminal", 130, 30)]
+
+# 파서
+eq("parse_clients: 헤더 + 1행", {"terminal_1"}, bar.parse_clients(LC_HEADER + "1          terminal_1      zsh -l\n"))
+eq("parse_clients: 클라이언트 여러 개·plugin pane·명령 없음 행", {"terminal_3", "plugin_2"},
+   bar.parse_clients(LC_HEADER + "1 plugin_2 zellij:session-manager\n2   terminal_3\n\n"))
+eq("parse_clients: 헤더 없이 행만도 읽음", {"terminal_9"}, bar.parse_clients("4 terminal_9 vim\n"))
+eq("parse_clients: 이상한 출력은 None (헤더만·빈 출력·오류 문구·id 이상·pane 이름 이상·None)", [None] * 6,
+   [bar.parse_clients(s) for s in (LC_HEADER, "", "Error: x\n", LC_HEADER + "a terminal_1 zsh\n", LC_HEADER + "1 pane_1 zsh\n", None)])
+
+# (a) 캐시 미스: list-clients(바 포커스 확인) → list-panes 1회 → focus-next-pane → list-clients(목표 확인)
+fz = FakeZellij(RING, 0)
+run_restore(fz, plan=None)
+eq("(a) 캐시 미스: 호출 순서 list-clients → list-panes → focus-next-pane → list-clients", [LC, LP, FNP, LC], fz.calls)
+eq("(a) 캐시 미스: list-panes(큰 응답) 1회·포커스 = claude(7)·캐시 (7, 1)", (1, 7, (7, 1)), (fz.n(LP), fz.focus(), bar._focus_plan))
+# (b) 캐시 적중: list-panes 0회
+fz = FakeZellij(RING, 0)
 run_restore(fz)
-eq("restore_focus: 바 다음이 claude → focus-next-pane 1회, 포커스 = claude(7)", ([["focus-next-pane"]], 7), (fz.actions, fz.ring[fz.idx][0]))
-fz = FakeZellij([(5, "bar", 0, 1), (6, "terminal", 122, 27), (7, "claude", 0, 4)], 0)
+eq("(b) 캐시 적중: 호출 순서 list-clients → focus-next-pane → list-clients (list-panes 0회)", ([LC, FNP, LC], 0), (fz.calls, fz.n(LP)))
+eq("(b) 캐시 적중: 포커스 = claude(7), 캐시 유지", (7, (7, 1)), (fz.focus(), bar._focus_plan))
+# 목표가 두 칸 뒤
+ring2 = [(5, "bar", 0, 0), (6, "terminal", 0, 3), (7, "claude", 0, 20)]
+fz = FakeZellij(ring2, 0)
+run_restore(fz, plan=None)
+eq("두 칸 뒤 목표, 캐시 미스: 단계마다 list-clients 확인 → 캐시 (7, 2), list-panes 1회", ([LC, LP, FNP, LC, FNP, LC], 7, (7, 2)), (fz.calls, fz.focus(), bar._focus_plan))
+fz = FakeZellij(ring2, 0)
 run_restore(fz)
-eq("restore_focus: 목표가 두 칸 뒤면 focus-next-pane 2회 → claude(7)", ([["focus-next-pane"]] * 2, 7), (fz.actions, fz.ring[fz.idx][0]))
-fz = FakeZellij([(5, "bar", 0, 1), (7, "claude", 0, 4), (8, "files", 122, 4)], 0, focus_after_polls=3)
+eq("두 칸 뒤 목표, 캐시 적중: focus-next-pane 2회 + 검증 1회", ([LC, FNP, FNP, LC], 7), (fz.calls, fz.focus()))
+# (c) 검증 불일치 → 캐시 폐기 + list-panes 교정
+split = [(5, "bar", 0, 0), (9, "zsh", 0, 3), (7, "claude", 0, 20), (8, "files", 130, 3)]   # 캐시 (7, 1) 뒤에 pane 분할
+fz = FakeZellij(split, 0)
+run_restore(fz, plan=(7, 1))
+eq("(c) 낡은 캐시(pane 분할): 1칸 이동 → 검증 불일치 → 캐시 폐기 → list-panes로 교정(per-step 루프)",
+   ([LC, FNP, LC, LP, FNP, LP], 7, None), (fz.calls, fz.focus(), bar._focus_plan))
+fz = FakeZellij(split, 0)
 run_restore(fz)
-eq("restore_focus: 클릭 직후 포커스가 늦게 와도(click-through) 기다렸다가 복귀 (조회 3회 이상, 이동 1회)", (True, [["focus-next-pane"]], 7), (fz.polls >= 4, fz.actions, fz.ring[fz.idx][0]))
-fz = FakeZellij([(5, "bar", 0, 1), (7, "claude", 0, 4)], 1)           # 포커스가 이미 본문 — 바가 포커스 상태가 아님
+eq("(c) 다음 클릭은 캐시 미스로 다시 배움 → (7, 2)", ([LC, LP, FNP, LC, FNP, LC], 7, (7, 2)), (fz.calls, fz.focus(), bar._focus_plan))
+closed = [(5, "bar", 0, 0), (8, "files", 130, 3), (6, "terminal", 130, 30)]                # 캐시의 목표 claude(7)가 닫힘
+fz = FakeZellij(closed, 0)
+run_restore(fz, plan=(7, 1))
+eq("(c) 캐시의 목표 pane이 닫힘: 검증 불일치 → 폐기 → list-panes로 새 목표 files(8)가 이미 포커스 → 추가 이동 없음",
+   ([LC, FNP, LC, LP], 8, None), (fz.calls, fz.focus(), bar._focus_plan))
+fz = FakeZellij(RING[:2], 0)
+run_restore(fz, plan=(7, 2))
+eq("(c) 캐시 횟수가 고리를 한 바퀴 돌아 바로 돌아옴: 폐기 → 교정 1칸 → claude(7)", ([LC, FNP, FNP, LC, LP, FNP, LP], 7, None), (fz.calls, fz.focus(), bar._focus_plan))
+# (d) list-clients 판단 불가 → 기존 경로(list-panes만)
+for mode in ("fail", "timeout", "garbage", "header"):
+    fz = FakeZellij(RING, 0, clients=[mode])
+    run_restore(fz, plan=(7, 1))
+    eq("(d) 처음 list-clients가 %s → 캐시를 쓰지 않고 기존 경로 list-panes → focus-next-pane → list-panes, 포커스 claude(7)" % mode,
+       ([LC, LP, FNP, LP], 7), (fz.calls, fz.focus()))
+eq("(d) 처음부터 판단 불가면 캐시는 그대로 둔다 (쓰지 않았으므로)", (7, 1), bar._focus_plan)
+fz = FakeZellij(RING, 0, clients=["ok", "fail"])
+run_restore(fz, plan=(7, 1))
+eq("(d) 캐시 적중 뒤 검증 list-clients 실패 → 캐시 폐기 → list-panes 1회로 확인 (이미 claude) → 추가 이동 없음",
+   ([LC, FNP, LC, LP], 7, None), (fz.calls, fz.focus(), bar._focus_plan))
+fz = FakeZellij(ring2, 0, clients=["ok", "garbage"])
+run_restore(fz, plan=None)
+eq("(d) 캐시 미스 단계 확인 중 list-clients 이상 → 캐시 안 만듦 → list-panes로 이어서 교정 → claude(7)",
+   ([LC, LP, FNP, LC, LP, FNP, LP], 7, None), (fz.calls, fz.focus(), bar._focus_plan))
+fz = FakeZellij(RING, 0, clients=["fail"], panes_fail=True)
+run_restore(fz, plan=None)
+eq("(d) list-clients·list-panes 모두 실패 → 기다리지 않고 조용히 끝남 (각 1회, 이동 없음)", [LC, LP], fz.calls)
+# (e) 포커스가 늦게 옴 → list-clients로만 재확인
+fz = FakeZellij(RING, 0, focus_after=3)
+run_restore(fz, plan=None)
+eq("(e) 클릭 직후 포커스가 늦게 와도(click-through) list-clients로 재확인 → 4번째에 포커스 → 이후 캐시 미스 경로",
+   ([LC] * 4 + [LP, FNP, LC], 7), (fz.calls, fz.focus()))
+fz = FakeZellij(RING, 0, focus_after=2)
+run_restore(fz)
+eq("(e) 늦은 포커스 + 캐시 적중: 재확인도 list-clients, list-panes 0회", ([LC] * 3 + [FNP, LC], 0, 7), (fz.calls, fz.n(LP), fz.focus()))
+fz = FakeZellij([(5, "bar", 0, 0), (7, "claude", 0, 3)], 1)           # 포커스가 이미 본문 — 바가 포커스 상태가 아님
 bar.FOCUS_WAIT = 0.25
 t_start = time.monotonic()
 run_restore(fz)
 el = time.monotonic() - t_start
-check("restore_focus: 바가 끝내 포커스를 못 받으면(다른 pane이 포커스) FOCUS_WAIT 안에서 포기, 아무 동작도 안 함", fz.actions == [] and fz.ring[fz.idx][0] == 7 and 0.2 <= el < 1.5, "actions=%r el=%.2f" % (fz.actions, el))
+check("restore_focus: 바가 끝내 포커스를 못 받으면(다른 pane이 포커스) FOCUS_WAIT 안에서 포기, list-clients 재확인만·이동 없음",
+      set(fz.calls) == {LC} and len(fz.calls) >= 2 and fz.focus() == 7 and 0.2 <= el < 1.5, "calls=%r el=%.2f" % (fz.calls, el))
 bar.FOCUS_WAIT = 2.0
-calls = {"n": 0}
-bar._zellij_json = lambda a, t: (calls.__setitem__("n", calls["n"] + 1) or None)
-bar.restore_focus()
-check("restore_focus: 조회 실패(None)면 기다리지 않고 조용히 끝남", calls["n"] == 1)
-bar.MY_PANE_ID = ""
-calls["n"] = 0
-bar.restore_focus()
-check("restore_focus: ZELLIJ_PANE_ID 없으면 zellij를 부르지 않음", calls["n"] == 0)
-bar._zellij_json, bar.subprocess.run = real_json, real_run
+for bad_id in ("", "x"):
+    bar.MY_PANE_ID = bad_id
+    fz = FakeZellij(RING, 0)
+    run_restore(fz)
+    eq("restore_focus: ZELLIJ_PANE_ID %r 이면 zellij를 부르지 않음" % bad_id, [], fz.calls)
+bar.MY_PANE_ID = "5"
+
+# 클릭 1회 전체 (run_hit): go-to-tab-by-id 앞의 호출 = 클릭 지연, 뒤 = 표시 갱신
+RAW_T = [{"position": 0, "name": "alpha", "active": True, "tab_id": 10, "panes_to_hide": 0},
+         {"position": 1, "name": "beta", "active": False, "tab_id": 11, "has_bell_notification": True}]
+cdh = os.path.join(TMP, "cache-hit")
+fz = FakeZellij(RING, 0, raw_tabs=RAW_T)
+src = bar.TabSource("sh", cdh, fetch=fz.fetch_tabs, pid=os.getpid())
+src.poll(2.1)                                                       # 리더가 한 번 조회해 캐시를 쓴다 (준비)
+bar._focus_plan = None
+fz.calls = []
+patched(fz, bar.run_hit, ("tab", 11), src, os.path.join(TMP, "rows-h"))
+eq("(f) 탭 클릭(캐시 미스): list-clients → list-panes → focus-next-pane → list-clients → go-to-tab-by-id, list-tabs 0회",
+   [LC, LP, FNP, LC, GOTO], fz.calls)
+fz2 = FakeZellij(RING, 0, raw_tabs=RAW_T)
+src.fetch = fz2.fetch_tabs
+patched(fz2, bar.run_hit, ("tab", 10), src, os.path.join(TMP, "rows-h"))
+eq("(f) 탭 클릭(캐시 적중): list-clients → focus-next-pane → list-clients → go-to-tab-by-id (큰 응답 0회, list-tabs 0회)",
+   [LC, FNP, LC, GOTO], fz2.calls)
+src.fetch = fz.fetch_tabs
+
+# (f) A3 낙관적 갱신
+scenario("A3", "탭 클릭 뒤 낙관적 갱신 (mark_active) — rc=0이면 캐시 활성만 고쳐 쓰고, 아니면 refresh_now 폴백")
+
+
+def cache_active(cf):
+    with open(cf, encoding="utf-8") as f:
+        return [t["tab_id"] for t in json.load(f) if t.get("active")]
+
+
+cda = os.path.join(TMP, "cache-a3")
+fa3 = FakeZellij(RING, 0, raw_tabs=RAW_T)
+la = bar.TabSource("a3", cda, fetch=fa3.fetch_tabs, pid=os.getpid())
+fo3 = FakeZellij(RING, 0, raw_tabs=RAW_T)
+fo = bar.TabSource("a3", cda, fetch=fo3.fetch_tabs, pid=os.getpid() + 1_000_000)
+a0 = time.time()
+la.poll(2.1, a0)
+fo.poll(2.1, a0)
+eq("(준비) 리더 1회 조회·팔로워 0회, 활성 = 10", (1, 0, [10]), (fa3.n(LT), fo3.n(LT), cache_active(la.cache_file)))
+pid_file = os.path.join(la.lock_dir, "pid")
+pid_before = (open(pid_file).read(), os.stat(pid_file).st_mtime_ns)
+with open(la.cache_file, encoding="utf-8") as f:
+    raw_before = json.load(f)
+bar.MY_PANE_ID = ""                                                 # 포커스 복귀는 위에서 따로 봤다 — 여기선 탭 전환만
+fo3.calls = []
+patched(fo3, bar.run_hit, ("tab", 11), fo, os.path.join(TMP, "rows-a3"))
+eq("(f) rc=0: go-to-tab-by-id만, list-tabs 0회", [GOTO], fo3.calls)
+eq("(f) rc=0: 캐시 파일 활성 = 클릭한 탭(11)만", [11], cache_active(fo.cache_file))
+eq("(f) rc=0: 팔로워 자신의 탭 목록도 즉시 반영", [False, True], [t["active"] for t in fo.tabs])
+with open(fo.cache_file, encoding="utf-8") as f:
+    raw_after = json.load(f)
+eq("(f) rc=0: active 외 필드(이름·위치·벨·기타 키)는 그대로", [{k: v for k, v in t.items() if k != "active"} for t in raw_before],
+   [{k: v for k, v in t.items() if k != "active"} for t in raw_after])
+for rc in (1, "timeout"):
+    fo3.goto_rc, fo3.calls = rc, []
+    patched(fo3, bar.run_hit, ("tab", 10), fo, os.path.join(TMP, "rows-a3"))
+    eq("(f) go-to-tab-by-id %s → refresh_now 폴백 (list-tabs 1회, 캐시 = 조회 결과 활성 10)" % ("종료코드 1" if rc == 1 else "시간 초과"),
+       ([GOTO, LT], [10]), (fo3.calls, cache_active(fo.cache_file)))
+fo3.goto_rc, fo3.calls = 0, []
+patched(fo3, bar.run_hit, ("tab", 999), fo, os.path.join(TMP, "rows-a3"))
+eq("(f) rc=0이어도 캐시에 그 탭이 없으면 refresh_now 폴백", [GOTO, LT], fo3.calls)
+fo3.calls = []
+eq("(f) source 없음(레거시)·탭 클릭: 예외 없이 go-to-tab만", (None, [GOTO]), (patched(fo3, bar.run_hit, ("tab", 11), None, os.path.join(TMP, "rows-a3")), fo3.calls))
+nuz = bar.TabSource("a3x", os.path.join(blocker, "sub2"), fetch=fo3.fetch_tabs, pid=os.getpid())
+eq("(f) 캐시 디렉터리를 못 쓰면 mark_active False (호출자가 refresh_now)", False, nuz.mark_active(11))
+cdb = os.path.join(TMP, "cache-a3b")
+os.makedirs(cdb)
+nb = bar.TabSource("a3b", cdb, fetch=fo3.fetch_tabs, pid=os.getpid())
+eq("(f) 캐시 파일이 아직 없으면 mark_active False", False, nb.mark_active(11))
+with open(nb.cache_file, "w") as f:
+    f.write("{not json")
+eq("(f) 캐시 파일이 깨졌으면 mark_active False (예외 없음)", False, nb.mark_active(11))
+
+# (g) 낙관적 갱신이 리더 선출·캐시 규약을 깨지 않음
+eq("(g) 팔로워의 mark_active·폴백 뒤에도 리더 pid 파일 내용·mtime 그대로 (하트비트 위조 없음)", pid_before, (open(pid_file).read(), os.stat(pid_file).st_mtime_ns))
+eq("(g) 팔로워는 리더가 되지 않음·락 디렉터리 1개", (False, True, 1),
+   (fo.is_leader, la.is_leader, len([n for n in os.listdir(cda) if n.endswith(".lock")])))
+eq("(g) 임시 파일 잔여 없음 (write_atomic)", [], [n for n in os.listdir(cda) if ".tmp." in n])
+fo3.calls = []
+patched(fo3, bar.run_hit, ("tab", 11), fo, os.path.join(TMP, "rows-a3"))
+eq("(준비) 팔로워 낙관적 갱신 → 캐시 활성 11", [11], cache_active(la.cache_file))
+fa3.calls = []
+ch = la.poll(2.6, a0 + 0.5)
+eq("(g) 리더: 다음 주기 전엔 조회 없이 팔로워가 쓴 캐시를 읽는다 (sig 변화 감지)", (True, [], [False, True]), (ch, fa3.calls, [t["active"] for t in la.tabs]))
+la.poll(3.2, a0 + 1.1)
+eq("(g) 리더: 1초 주기 조회가 진실(활성 10)로 교정해 캐시에 씀", ([LT], [10]), (fa3.calls, cache_active(la.cache_file)))
+fo3.calls = []
+fo.poll(3.3, a0 + 1.2)
+eq("(g) 팔로워도 교정된 목록을 읽음 (조회 0회)", ([True, False], []), ([t["active"] for t in fo.tabs], fo3.calls))
+fa3.calls = []
+check("(g) 리더 자신의 mark_active: True", la.mark_active(11))
+ch = la.poll(3.4, a0 + 1.3)
+eq("(g) 리더: 자기 쓰기는 다시 읽지 않고(sig 기억) 조회 주기도 그대로 (조회 0회)", (False, []), (ch, fa3.calls))
+# 죽은 리더 + 팔로워 낙관적 쓰기 → 인수는 그대로 된다
+dead2 = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
+dead2.wait()
+cdz = os.path.join(TMP, "cache-a3z")
+zl = bar.TabSource("a3z", cdz, fetch=FakeZellij(RING, 0, raw_tabs=RAW_T).fetch_tabs, pid=dead2.pid)
+zl.poll(2.1)
+fzz = FakeZellij(RING, 0, raw_tabs=RAW_T)
+zf = bar.TabSource("a3z", cdz, fetch=fzz.fetch_tabs, pid=os.getpid())
+check("(준비) 죽은 pid가 리더, 팔로워 mark_active 성공", open(zl.pid_file).read().strip() == str(dead2.pid) and zf.mark_active(11))
+zf.poll(4.5, time.time() + 2.0)
+eq("(g) 팔로워 쓰기로 캐시가 신선해도, 보유자가 죽었으면 캐시 1.5초 뒤 인수·조회", (True, 1), (zf.is_leader, fzz.n(LT)))
+zf.close()
+bar.MY_PANE_ID = "5"
 
 # ── E2: 조회 실패 백오프가 STALE_SECS보다 길어도 리더 유지 (하트비트) ──────
 scenario("E2", "조회 실패 백오프 중 리더 하트비트 — 팔로워가 인수하지 않음")
@@ -707,3 +956,6 @@ while tt < 30:                                # 30초 동안 조회 계속 실�
 check("30초 연속 조회 실패(백오프 8초 상한): 팔로워가 한 번도 리더를 인수하지 않음", takeovers == 0 and L.is_leader and ff.calls == 0, "takeovers=%d leader=%s follower_calls=%d" % (takeovers, L.is_leader, ff.calls))
 check("백오프가 실제로 STALE_SECS(3초)보다 길었다 (조회 시도 수가 적다: 30초에 10회 이하)", fl.calls <= 10 and L.next_fetch - (b0 + 29.9) > 0, "calls=%d" % fl.calls)
 check("실패 중에도 마지막 탭 목록 유지", len(L.tabs or []) == 2 and len(F.tabs or []) == 2)
+
+scenario("Z", "안전장치 — 이 시험 전체에서 실제 zellij 호출 0회")
+eq("실제 zellij 호출(가짜로 바꾸지 않은 경로) 0회", [], REAL_ZELLIJ)
