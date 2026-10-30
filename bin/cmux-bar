@@ -18,10 +18,15 @@ cmux-bar — zellij 상단 탭 줄 + 툴바 (직접 그리는 curses 바)
   탭·에이전트·세션을 닫아 버리는 사고가 난다. 클릭한 바는 자기 탭 본문 pane으로 포커스를 돌려놓는다
   (picker 클릭은 예외 — 새 floating pane이 포커스를 가져간다).
 
+탭 라벨 배지: blocked `!`(흰 글자·빨간 배경) > 벨 `*` > working `~` > 없음(idle). 상태 배지(`!` `~`)는 라벨 오른쪽 패딩 칸을
+  대신 차지해 폭이 변하지 않는다(탭이 밀리지 않음). 벨 `*`은 예전처럼 이름 뒤에 한 칸을 더한다.
+  에이전트 상태는 cmux-agent-state 훅이 쓴 상태 파일에서 리더가 읽어 캐시에 `cmux_state`로 싣는다.
+
 공유 상태 (표준 라이브러리만, 네트워크·LLM 없음):
   토글 상태 파일  ${CMUX_TABBAR_STATE_FILE:-$HOME/.config/cmux/tabbar-rows}  (1 또는 2, 없으면 1)
   탭 목록 캐시    ${CMUX_BAR_CACHE_DIR:-${TMPDIR:-/tmp}/cmux-bar-$UID}/tabs-<세션>.json
                   리더 1개만 1초마다 `zellij action list-tabs --json`을 부르고 나머지는 파일만 읽는다.
+  에이전트 상태    ${CMUX_AGENT_STATE_DIR:-$HOME/.config/cmux/agent-state}/<세션>/<pane_id>  (리더만 읽는다)
 """
 
 import curses
@@ -73,8 +78,13 @@ FETCH_BACKOFF_MAX = 8.0           # 조회 실패 시 재시도 간격 상한(�
 WHEEL_THROTTLE = 0.1              # 휠 이벤트 최소 간격(초)
 FOCUS_WAIT = 1.0                  # 클릭 처리 때 자기 pane이 포커스를 받기를 기다리는 최대 시간(초)
 
+# 에이전트 상태 (bin/cmux-agent-state 와 같은 값·같은 규칙 — 시험이 두 구현의 결과를 대조한다)
+STALE_WORKING_SECS = 300          # working이 이만큼 갱신 없으면 idle로 본다 (ESC 중단은 Stop이 안 와서 고착된다)
+ABANDON_SECS = 12 * 3600          # ts가 이보다 오래된 상태 파일은 무시(가능하면 삭제)
+STATE_RANK = {"blocked": 3, "working": 2, "idle": 1}
+
 # 색 쌍 번호 (curses.init_pair)
-CP_LOGO, CP_SEP, CP_BTN, CP_SESS, CP_ACTIVE, CP_MORE = 1, 2, 3, 4, 5, 6
+CP_LOGO, CP_SEP, CP_BTN, CP_SESS, CP_ACTIVE, CP_MORE, CP_BLOCKED = 1, 2, 3, 4, 5, 6, 7
 
 # 마우스: 눌림 이벤트만 받는다 (눌림+뗌을 둘 다 받으면 클릭 한 번에 동작이 두 번 실행된다)
 # BUTTON5(휠 아래)는 ncurses 마우스 버전 1 빌드(macOS 시스템 python 등)에 없을 수 있다 → 0.
@@ -116,15 +126,37 @@ def truncate_name(name: str, maxw: int = TAB_NAME_MAX) -> str:
     return clip_width(name, maxw - 1) + "…"
 
 
+def tab_badge(tab: dict) -> str:
+    """이름 뒤 배지 1칸: blocked '!' > 벨 '*' > working '~' > 없음(''). state가 없는 옛 탭 dict도 받는다."""
+    state = tab.get("state") or ""
+    if state == "blocked":
+        return "!"
+    if tab["bell"]:
+        return "*"
+    if state == "working":
+        return "~"
+    return ""
+
+
 def tab_label(tab: dict) -> str:
-    """탭 하나의 표시 문자열: 앞뒤 공백 1칸 + 이름(최대 14칸) + 벨 알림이면 '*'."""
-    return " " + truncate_name(tab["name"]) + ("*" if tab["bell"] else "") + " "
+    """탭 하나의 표시 문자열: 앞뒤 공백 1칸 + 이름(최대 14칸).
+
+    배지가 상태 배지('!' blocked · '~' working)면 오른쪽 패딩 칸을 대신 차지한다(" 이름!") — 폭은 배지 없는 라벨과 같다.
+    working↔idle이 바뀌어도 오른쪽 탭이 밀리지 않게 하려는 것이다. 벨 '*'이 이기면 예전처럼 " 이름* " (+1칸).
+    """
+    badge = tab_badge(tab)
+    if badge in ("!", "~"):
+        return " " + truncate_name(tab["name"]) + badge
+    return " " + truncate_name(tab["name"]) + badge + " "
 
 
 # ── 탭 목록 정규화 · 창 선택 ───────────────────────────────────────────────
 
 def normalize_tabs(raw) -> list:
-    """list-tabs --json 결과 → [{name, active, id, bell}] (position 순). 형식이 다르면 빈 목록."""
+    """list-tabs --json 결과 → [{name, active, id, bell, state}] (position 순). 형식이 다르면 빈 목록.
+
+    state = 캐시에 리더가 실은 cmux_state (blocked|working|idle). 없거나 이상하면 "" (옛 캐시 호환).
+    """
     if not isinstance(raw, list):
         return []
     items = []
@@ -141,6 +173,7 @@ def normalize_tabs(raw) -> list:
             "active": bool(t.get("active")),
             "id": tid if isinstance(tid, int) and not isinstance(tid, bool) else None,
             "bell": bool(t.get("has_bell_notification")),
+            "state": t["cmux_state"] if isinstance(t.get("cmux_state"), str) and t["cmux_state"] in STATE_RANK else "",
         }))
     items.sort(key=lambda x: (x[0], x[1]))
     return [t for _, _, t in items]
@@ -280,6 +313,70 @@ def toggle_rows(path: str) -> int:
     """1↔2 토글하고 (쓰기 실패하면 실제 파일 상태를) 반환."""
     write_rows(path, 1 if read_rows(path) == 2 else 2)
     return read_rows(path)
+
+
+# ── 에이전트 상태 파일 읽기 ─────────────────────────────────────────────────
+
+def agent_state_dir(session: str) -> str:
+    """${CMUX_AGENT_STATE_DIR:-$HOME/.config/cmux/agent-state}/<세션> ('/'는 '_' — cmux-agent-state와 같은 규칙)."""
+    root = os.environ.get("CMUX_AGENT_STATE_DIR")
+    if not root:
+        home = os.environ.get("HOME") or os.path.expanduser("~")
+        root = os.path.join(home, ".config", "cmux", "agent-state")
+    return os.path.join(root, session.replace("/", "_"))
+
+
+def tab_key(name: str) -> str:
+    """상태 파일의 tab= 과 맞출 탭 이름 — 줄바꿈·CR·TAB만 공백으로 (cmux-agent-state의 _tab_key와 같은 규칙)."""
+    return name.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+
+
+def read_agent_states(session: str, now: float = None, prune: bool = True) -> dict:
+    """세션의 상태 디렉터리 → {탭 이름: 'blocked'|'working'|'idle'} (cmux-agent-state rollup 과 같은 규칙).
+
+    파일명은 숫자만. 내용 `state=` `ts=` `tab=`(마지막 줄 우선). 탭별 blocked > working > idle,
+    working인데 ts가 STALE_WORKING_SECS 넘게 낡았으면 idle, ts가 ABANDON_SECS 넘은 파일은 무시(prune이면 삭제).
+    디렉터리가 없거나 읽을 수 없으면 {} — 예외 없음.
+    """
+    now = time.time() if now is None else now
+    d = agent_state_dir(session)
+    out: dict = {}
+    try:
+        names = [n for n in os.listdir(d) if re.fullmatch(r"[0-9]+", n)]
+    except OSError:
+        return out
+    for n in names:
+        path = os.path.join(d, n)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read(4096)
+        except OSError:
+            continue
+        kv: dict = {}
+        for line in text.split("\n"):
+            k, sep, v = line.partition("=")
+            if sep and k in ("state", "ts", "tab"):
+                kv[k] = v
+        ts, tab, st = kv.get("ts", ""), kv.get("tab", ""), kv.get("state", "")
+        if not re.fullmatch(r"[0-9]+", ts) or not tab:
+            continue
+        age = max(0, now - int(ts))
+        if age > ABANDON_SECS:
+            if prune:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            continue
+        if st == "working":
+            eff = "idle" if age > STALE_WORKING_SECS else "working"
+        elif st in ("blocked", "idle"):
+            eff = st
+        else:
+            continue
+        if STATE_RANK[eff] > STATE_RANK.get(out.get(tab), 0):
+            out[tab] = eff
+    return out
 
 
 # ── 탭 목록 캐시 · 리더 선출 ───────────────────────────────────────────────
@@ -611,6 +708,7 @@ class TabSource:
     """탭 목록 공급자 — 리더면 list-tabs를 1초마다 불러 캐시에 쓰고, 아니면 캐시 파일만 읽는다."""
 
     def __init__(self, session: str, cache_dir: str, fetch=fetch_tabs, pid=None):
+        self.session = session
         self.cache_file, self.lock_dir = cache_paths(cache_dir, session)
         self.pid_file = os.path.join(self.lock_dir, "pid")
         self.cache_dir = cache_dir
@@ -641,6 +739,21 @@ class TabSource:
         self.tabs = tabs
         return changed
 
+    def _inject_states(self, raw) -> None:
+        """list-tabs 결과의 탭마다 에이전트 상태를 `cmux_state`로 싣는다 (캐시에 쓰기 직전 — 팔로워는 캐시만 읽는다). 실패는 무시."""
+        try:
+            states = read_agent_states(self.session)
+        except Exception:  # noqa: BLE001 — 상태 표시는 탭 줄을 막지 않는다
+            return
+        for t in raw:
+            if isinstance(t, dict):
+                name = t.get("name")
+                st = states.get(tab_key(name)) if isinstance(name, str) else None
+                if st:
+                    t["cmux_state"] = st
+                else:
+                    t.pop("cmux_state", None)
+
     def _refresh(self, now: float, leader: bool) -> bool:
         if leader:
             _touch(self.pid_file, now)            # 하트비트 — 조회가 느려도 인수당하지 않게
@@ -651,6 +764,7 @@ class TabSource:
                 self.next_fetch = now + min(FETCH_SECS * (2 ** self.fail_streak), FETCH_BACKOFF_MAX)
                 _touch(self.cache_file, now)      # 리더는 살아 있다 → 팔로워 인수 방지, 마지막 캐시 유지
             return False
+        self._inject_states(raw)
         text = json.dumps(raw, ensure_ascii=False)
         if write_atomic(self.cache_file, text):
             try:
@@ -911,8 +1025,15 @@ def draw_strip(stdscr, rows: int, tabs, placeholder: bool, hits: list) -> None:
                 else:
                     attr = curses.A_NORMAL
                 put(stdscr, li, x, text, attr)
-                if tab["bell"] and tw >= 2 and str_width(labels[idx]) == tw:
-                    put(stdscr, li, x + tw - 2, "*", (attr if tab["active"] else curses.color_pair(CP_SESS)) | curses.A_BOLD)
+                badge = tab_badge(tab)
+                if badge in ("!", "*") and tw >= 2 and str_width(labels[idx]) == tw:
+                    if badge == "!":                  # blocked — 라벨 마지막 칸(패딩 자리). 활성/비활성 모두 흰 글자·빨간 배경으로 눈에 띄게
+                        battr = curses.color_pair(CP_BLOCKED) | curses.A_BOLD
+                        bx = x + tw - 1
+                    else:                             # 벨 * — 끝 패딩 공백 앞 칸 (예전 그대로)
+                        battr = (attr if tab["active"] else curses.color_pair(CP_SESS)) | curses.A_BOLD
+                        bx = x + tw - 2
+                    put(stdscr, li, bx, badge, battr)
                 if tab["id"] is not None and tw > 0:
                     hits.append((li, x, x + tw - 1, ("tab", tab["id"])))
         last = len(plan["lines"]) - 1
@@ -946,6 +1067,7 @@ def init_colors() -> None:
     curses.init_pair(CP_SESS,   curses.COLOR_YELLOW, -1)                  # session name · 벨 *
     curses.init_pair(CP_ACTIVE, curses.COLOR_BLACK,  curses.COLOR_CYAN)   # 활성 탭 (색 반전 + 굵게)
     curses.init_pair(CP_MORE,   8,                   -1)                  # … ‹N N› (dim gray)
+    curses.init_pair(CP_BLOCKED, curses.COLOR_WHITE, curses.COLOR_RED)    # blocked 배지 !
 
 
 def run_hit(act, source: TabSource, state_file: str):

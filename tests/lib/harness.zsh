@@ -5,7 +5,7 @@
 #   - zellij 호출은 항상 -s "$T_SESSION"(cmuxt<pid>) 명시. ZELLIJ* env는 source 시점에 제거한다.
 #   - cmux 실행 전 _t_guard가 CMUX_SESSION=cmuxt<숫자>를 확인한다 (기본값 'claude'로 새는 것 차단).
 #   - 사용자 홈 설정은 쓰지 않는다 — CMUX_TABS_FILE / CMUX_CONFIG_FILE / CMUX_PROJECT_AGENTS_FILE / CMUX_EXTRAS_FILE / CMUX_AGENT_ARGS_FILE /
-#     CMUX_LAYOUTS_DIR / CLAUDE_CONFIG_DIR / ZDOTDIR 를 임시 루트(T_ROOT)로 격리. 예외: zellij가 세션마다 만드는 캐시(session_info/<테스트세션>)는 정리 때 지운다.
+#     CMUX_AGENT_STATE_DIR / CMUX_LAYOUTS_DIR / CLAUDE_CONFIG_DIR / ZDOTDIR 를 임시 루트(T_ROOT)로 격리(+ CMUX_STATE_HOOKS=0). 예외: zellij가 세션마다 만드는 캐시(session_info/<테스트세션>)는 정리 때 지운다.
 #   - zellij 0.45.1 #5632: 새 서버가 첫 클라이언트를 초기화하기 전에 다른 zellij CLI가 소켓에 붙었다 끊으면
 #     서버가 panic하고(zellij.log: zellij-server/src/lib.rs:1462) 세션을 만들던 클라이언트는 화면 없이 멈춘다.
 #     list-sessions·action …·delete-session 은 모두 소켓을 건드리므로, 새 세션이 생길 수 있는 cmux 실행 뒤에는
@@ -20,6 +20,10 @@ zmodload zsh/datetime
 # ZELLIJ* 제거 — 라이브 세션 pane 안에서 실행돼도 'zellij action'이 라이브 세션을 겨냥하지 못하게
 for _t_v in ${(k)parameters[(I)ZELLIJ*]}; do unset "$_t_v"; done
 unset _t_v
+
+# 상태 훅 주입(--settings, bin/cmux의 _state_hook_args)은 시험에서 기본으로 끈다 — claude argv를 정확 비교하는 기존 시험이 그대로 통과하게.
+# 상태 배지 시험(unit t07_agent_state · integration t09_state_badge)만 CMUX_STATE_HOOKS=1 로 켠다.
+export CMUX_STATE_HOOKS=0
 
 typeset -r T_LIVE_SESSION="claude"   # 라이브 세션 이름 — 조회만, 절대 변경 금지
 T_REPO="${${(%):-%x}:A:h:h:h}"
@@ -132,6 +136,7 @@ t_setup() {
   export CMUX_PROJECT_AGENTS_FILE="$T_ROOT/cfg/project-agents"
   export CMUX_EXTRAS_FILE="$T_ROOT/cfg/projects"
   export CMUX_AGENT_ARGS_FILE="$T_ROOT/cfg/agent-args"
+  export CMUX_AGENT_STATE_DIR="$T_ROOT/cfg/agent-state"
   unset CMUX_AGENT CMUX_DEFAULT_AGENT
   export CMUX_LAYOUTS_DIR="$T_ROOT/layouts"
   export CMUX_BAR_BIN="$T_ROOT/bin/cmux-bar-stub"

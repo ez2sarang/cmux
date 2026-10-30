@@ -87,6 +87,8 @@ cmux list            # 프로젝트 목록
 cmux -l              # zellij 세션 목록
 cmux -k              # 세션 재시작 — 같은 탭 복원 + 각 탭 Claude 대화 이어서 (세션 안/밖 모두)
 cmux kill            # 세션 종료만 (탭 기록 보존 → 다음 cmux가 복원)
+cmux status          # 탭별 에이전트 상태 표 (blocked → working → idle 순, 기록 없는 탭은 -)
+cmux jump            # 다음 blocked(입력 대기) 탭으로 이동 — 현재 탭 다음부터 끝에서 처음으로 순환
 ```
 
 `cmux -k`를 세션 안(터미널 pane)에서 실행하면 세션이 종료된 직후 같은 터미널에서 자동으로 같은 탭이 다시 만들어집니다. 이 자동 복원은 `cmux`로 세션을 열었을 때 동작하며, `zellij attach`로 직접 붙은 경우에는 셸에서 `cmux`를 한 번 더 실행하면 됩니다. 세션이 죽은 상태에서 `cmux <경로>`를 실행하면 이전 탭들도 함께 복원되고 지정한 경로가 새 탭으로 추가됩니다(기록을 버리고 새로 시작하려면 `cmux pick`).
@@ -115,6 +117,7 @@ cmux kill            # 세션 종료만 (탭 기록 보존 → 다음 cmux가 �
 - **바 pane의 키는 `p`(피커)와 `t`(토글)뿐입니다. `x`(탭 닫기)·`q`(세션 종료) 키는 일부러 없앴습니다** — Close/Quit은 `× Close`·`⏻ Quit` 버튼 클릭으로만 합니다. 클릭한 바는 자기 탭의 본문(에이전트) pane으로 포커스를 돌려놓습니다(탭 전환 전에 수행; Picker 클릭은 새 floating pane이 포커스를 가져가므로 제외). 포커스를 바에 남겨 두면 나중에 그 탭에서 친 키가 바로 들어가기 때문입니다. (이동은 `focus-next-pane` 반복 — zellij 0.45.1의 `focus-pane-id`는 `mouse_click_through true`에서 클릭이 준 키보드 포커스를 옮기지 못함을 실측. 포커스 확인은 작은 `zellij action list-clients` 응답으로 하고, 바 프로세스가 목표 pane과 이동 횟수를 기억해 두 번째 클릭부터는 큰 `list-panes` 조회 없이 이동합니다. 이동 뒤 확인이 틀리면 기억을 버리고 `list-panes`로 교정하고, 확인 자체를 판단할 수 없으면(`list-clients` 실패·형식 이상) 기억은 유지한 채 `list-panes` 기반의 기존 경로로 처리합니다. 단일 클라이언트 접속을 전제로 합니다 — 여러 클라이언트가 붙어 있으면 "아무 클라이언트에서든 포커스"로 판단합니다.)
 - 첫 클릭부터 동작하려면 zellij `mouse_click_through true`가 필요합니다(레포 `zellij/config.kdl`에 포함; 서버 시작 때만 읽힘 → 이미 떠 있는 세션은 `cmux -k` 후부터, 사용자 `~/.config/zellij/config.kdl`에는 직접 병합). 이 설정이 없으면 포커스 없는 pane의 첫 클릭은 포커스 이동에만 쓰이고 탭 이동은 두 번 클릭해야 합니다.
 - 탭 목록은 세션당 한 바(리더)만 1초마다 `zellij action list-tabs --json`으로 조회해 `$TMPDIR/cmux-bar-$UID/tabs-<세션>.json`(`CMUX_BAR_CACHE_DIR`)에 쓰고 나머지는 파일만 읽습니다. 바 시작 직후 2초 동안은 zellij CLI를 부르지 않으며(zellij 서버 초기화 충돌 회피), 그 사이 3초 미만의 신선한 캐시가 있으면 그 탭 목록을 바로 그리고 없으면 `…`만 그립니다.
+- **에이전트 상태 배지**: 탭 라벨의 오른쪽 패딩 칸을 대신 차지해 에이전트 상태가 붙습니다(폭 불변 — working↔idle이 바뀌어도 오른쪽 탭이 밀리지 않음; 벨 `*`만 예전처럼 한 칸을 더함) — blocked `!`(흰 글자·빨간 배경, 권한 요청·질문 대기) > 벨 `*` > working `~` > 없음(idle). cmux가 띄우는 claude에 `--settings` 훅(`bin/cmux-agent-state hook <이벤트>`, 전역 settings는 건드리지 않고 병합됨)을 붙이고, 훅이 `~/.config/cmux/agent-state/<세션>/<pane_id>`(`CMUX_AGENT_STATE_DIR`)에 상태를 원자적으로 씁니다. 리더 바가 1초 `list-tabs` 직후 이 디렉터리를 읽어 캐시에 실어 모든 바가 그립니다. 탭은 `CMUX_TAB_NAME`(cmux가 export한 탭 이름)으로 묶이고, 탭 안 여러 파일은 blocked > working > idle로 합칩니다. `~`는 300초 넘게 갱신이 없으면 idle로 보고(ESC 중단은 Stop 훅이 오지 않음), 12시간 넘은 파일은 무시합니다. 끄기: `CMUX_STATE_HOOKS=0`. 한계: 탭을 수동으로 이름 바꾸면 매칭되지 않고, 같은 이름의 탭 둘은 합쳐지며, 권한 거부 직후에는 다음 도구 호출·Stop까지 blocked가 남습니다. codex/opencode/gemini는 훅 없이 `CMUX_TAB_NAME`만 export합니다(보류).
 - **레거시 모드**: 바 pane의 내용이 1행뿐이면(옛 레이아웃으로 만든 탭 — 위에 네이티브 `tab-bar`가 따로 있음) 예전처럼 툴바 1행만 그립니다. 새 구조는 설치된 레이아웃을 다시 설치(`install.sh --force`)한 뒤 새로 만든 탭/세션부터 적용됩니다(`cmux`가 직접 만드는 세션·`cmux-tab-<에이전트>` 레이아웃은 즉시 새 구조).
 
 ### zellij 내 단축키
@@ -173,6 +176,7 @@ cmux/
 ├── bin/
 │   ├── cmux             # 메인 스크립트 (zsh)
 │   ├── cmux-bar         # 상단 탭 줄 + 툴바, 1↔2줄 토글 (Python curses)
+│   ├── cmux-agent-state # 에이전트 상태 훅·롤업 (zsh) — 탭 배지, cmux status/jump
 │   └── cmux-picker      # 커서 기반 피커 (Python)
 ├── zellij/
 │   ├── config.kdl        # zellij 메인 설정

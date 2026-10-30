@@ -957,5 +957,241 @@ check("30초 연속 조회 실패(백오프 8초 상한): 팔로워가 한 번�
 check("백오프가 실제로 STALE_SECS(3초)보다 길었다 (조회 시도 수가 적다: 30초에 10회 이하)", fl.calls <= 10 and L.next_fetch - (b0 + 29.9) > 0, "calls=%d" % fl.calls)
 check("실패 중에도 마지막 탭 목록 유지", len(L.tabs or []) == 2 and len(F.tabs or []) == 2)
 
+# ── A: 에이전트 상태 배지 ───────────────────────────────────────────────────
+scenario("A", "에이전트 상태 배지 — 우선순위 · 폭 · 옛 캐시 호환 · 상태 파일 읽기 · 리더 주입")
+
+
+def st_tab(name, state=None, bell=False, active=False, tid=0):
+    d = tab(name, active, tid, bell)
+    if state is not None:
+        d["state"] = state
+    return d
+
+
+eq("배지 우선순위: blocked ! > 벨 * > working ~ > 없음",
+   ["!", "!", "*", "*", "~", "", ""],
+   [bar.tab_badge(st_tab("a", "blocked")), bar.tab_badge(st_tab("a", "blocked", bell=True)),
+    bar.tab_badge(st_tab("a", "working", bell=True)), bar.tab_badge(st_tab("a", "idle", bell=True)),
+    bar.tab_badge(st_tab("a", "working")), bar.tab_badge(st_tab("a", "idle")), bar.tab_badge(st_tab("a", ""))])
+eq("state 필드가 없는 옛 탭 dict: 벨 없으면 배지 없음 / 벨이면 *", ["", "*"], [bar.tab_badge(st_tab("a")), bar.tab_badge(st_tab("a", bell=True))])
+eq("라벨: 상태 배지는 끝 패딩 칸을 대신 차지 — blocked ' alpha!', working ' alpha~', idle ' alpha ' / 벨 ' alpha* ' (+1칸, 예전 그대로)",
+   [" alpha!", " alpha~", " alpha ", " alpha* "],
+   [bar.tab_label(st_tab("alpha", "blocked")), bar.tab_label(st_tab("alpha", "working")), bar.tab_label(st_tab("alpha", "idle")),
+    bar.tab_label(st_tab("alpha", bell=True))])
+# (1) 같은 이름·같은 벨 상태에서 idle / working / blocked 라벨 폭이 모두 같다 (벨 없음: 배지 없는 라벨과도 같음)
+for nm in ("alpha", "x" * 40, "한글", "", "a" * 14, "한" * 7):
+    base = bar.str_width(bar.tab_label(st_tab(nm)))
+    wl = [bar.str_width(bar.tab_label(st_tab(nm, sv))) for sv in ("idle", "working", "blocked", "", None)]
+    eq("(1) 벨 없음: idle/working/blocked/상태 없음 라벨 폭이 모두 같다 (이름 %r)" % nm[:6], [base] * 5, wl)
+    bb = bar.str_width(bar.tab_label(st_tab(nm, None, True)))
+    eq("(1) 벨 있음: idle/working/상태 없음 폭이 같고 벨 * 은 예전처럼 +1칸 (이름 %r)" % nm[:6], [base + 1] * 4,
+       [bb] + [bar.str_width(bar.tab_label(st_tab(nm, sv, True))) for sv in ("idle", "working", "")])
+eq("이름 14칸 자르기 + 상태 배지: 16칸 (배지 없는 라벨과 같음)", 16, bar.str_width(bar.tab_label(st_tab("y" * 40, "blocked"))))
+# (3) 벨 + 상태 조합의 우선순위와 라벨 (blocked ! > 벨 * > working ~ > 없음)
+combo = [("", False, "", " alpha "), ("idle", False, "", " alpha "), ("working", False, "~", " alpha~"), ("blocked", False, "!", " alpha!"),
+         ("", True, "*", " alpha* "), ("idle", True, "*", " alpha* "), ("working", True, "*", " alpha* "), ("blocked", True, "!", " alpha!")]
+eq("(3) 벨×상태 8조합: 배지와 라벨 (blocked가 벨을 이기면 라벨은 ' alpha!' 로 벨의 +1칸도 없음)",
+   [(b, l) for _, _, b, l in combo], [(bar.tab_badge(st_tab("alpha", sv, bl)), bar.tab_label(st_tab("alpha", sv, bl))) for sv, bl, _, _ in combo])
+# 상태가 전혀 없는 탭은 이 기능 이전 구현과 같다 (이름·벨 조합, 정규화 필드, 창 선택)
+PRE_REV = os.environ.get("T_PRE_BAR_REV", "86c4ed8")      # 상태 배지 기능 직전 커밋 (cmux-bar의 tab_label·normalize_tabs·plan_tabs 기준)
+PRE_BAR = os.path.join(TMP, "pre-feature-cmux-bar")
+_gp = subprocess.run(["git", "-C", os.path.dirname(os.path.abspath(BAR_PATH)), "show", "%s:bin/cmux-bar" % PRE_REV],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+if _gp.returncode == 0 and b"def tab_label" in _gp.stdout:
+    with open(PRE_BAR, "wb") as _f:
+        _f.write(_gp.stdout)
+if os.path.exists(PRE_BAR):
+    old_a = load(PRE_BAR, "cmux_bar_pre_feature")
+    eq("상태 없는 탭: tab_label이 이전 구현과 같다 (벨 유무 × 이름 6종)", True,
+       all(old_a.tab_label(tab(nm, False, 1, bl)) == bar.tab_label(st_tab(nm, None, bl)) for nm in ("alpha", "x" * 40, "한글", "", "a" * 14, "한" * 7) for bl in (False, True)))
+    raw_old = [{"position": 1, "name": "b\nx", "active": True, "tab_id": 2, "has_bell_notification": True}, {"position": 0, "name": "a", "tab_id": 1}, "junk"]
+    proj = lambda m: [(t["name"], t["active"], t["id"], t["bell"]) for t in m.normalize_tabs(raw_old)]
+    eq("상태 없는 탭: normalize_tabs의 기존 필드가 이전 구현과 같다", proj(old_a), proj(bar))
+    eq("상태 없는 탭: plan_tabs가 이전 구현과 같다 (28탭 × 폭 40~200 × 활성 위치)", True,
+       all(old_a.plan_tabs([old_a.str_width(old_a.tab_label(t)) for t in mk_tabs(NAMES28, 5, {5, 9})], a, [w - 3, w - 11])
+           == bar.plan_tabs(widths_of(mk_tabs(NAMES28, 5, {5, 9})), a, [w - 3, w - 11]) for w in (40, 80, 120, 200) for a in (0, 13, 27)))
+else:
+    print("SKIP\t기능 직전 커밋(%s)을 git에서 못 꺼냄 — 상태 없는 탭의 이전 구현 대조 생략" % PRE_REV)
+
+# normalize_tabs — 옛 캐시(필드 없음)·정상·이상 값
+n_old = bar.normalize_tabs([{"position": 0, "name": "a", "active": True, "tab_id": 1}, {"position": 1, "name": "b", "tab_id": 2, "has_bell_notification": True}])
+eq("정규화: cmux_state 없는 옛 캐시 → state '' (예외 없음)", ["", ""], [t["state"] for t in n_old])
+n_new = bar.normalize_tabs([{"position": i, "name": "t%d" % i, "tab_id": i, "cmux_state": v}
+                            for i, v in enumerate(("blocked", "working", "idle", "bogus", 5, ["x"], None, {"a": 1}, True))])
+eq("정규화: blocked/working/idle만 싣고 이상한 값(문자열·숫자·리스트·None·dict·bool)은 ''", ["blocked", "working", "idle", "", "", "", "", "", ""], [t["state"] for t in n_new])
+eq("정규화: 기존 필드(name,active,id,bell)는 그대로", [("a", True, 1, False), ("b", False, 2, True)], [(t["name"], t["active"], t["id"], t["bell"]) for t in n_old])
+
+# 그리기 — 클릭 영역이 라벨 폭과 일치하고, ! 는 빨간 배경 색 쌍·굵게로 덧그려진다 (활성/비활성 모두)
+dt = [st_tab("alpha", "blocked", active=True, tid=1), st_tab("beta", "blocked", tid=2), st_tab("gamma", "working", tid=3),
+      st_tab("delta", "idle", bell=True, tid=4), st_tab("eps", "idle", tid=5)]
+scr = FakeScr(2, 120)
+hits = []
+bar.draw_strip(scr, 1, dt, False, hits)
+th = [h for h in hits if h[3][0] == "tab"]
+eq("배지 탭 5개: 클릭 영역 폭 = 라벨 폭", [bar.str_width(bar.tab_label(t)) for t in dt], [h[2] - h[1] + 1 for h in th])
+check("배지 탭: 화면 셀이 라벨과 일치 (' alpha! ', ' gamma~ ' …)", all(scr.cells(h[0], h[1], h[2]) == bar.tab_label(dt[h[3][1] - 1]) for h in th), repr(scr.line(0)[:60]))
+check("영역들이 겹치지 않고 이어진다 (x0[i+1] = x1[i]+1)", all(th[i + 1][1] == th[i][2] + 1 for i in range(len(th) - 1)), repr([(h[1], h[2]) for h in th]))
+bang = [c for c in scr.calls if c[0] == "addstr" and c[3] == "!"]
+want_bang = (bar.CP_BLOCKED << 8) | curses.A_BOLD
+eq("! 덧그리기 2회 (활성 alpha·비활성 beta) 모두 빨간 배경 쌍 + 굵게", [want_bang, want_bang], [c[4] for c in bang])
+eq("! 는 라벨 마지막 칸(끝 패딩 자리)에 덧그린다 = 그 탭 클릭 영역의 마지막 열", [th[0][2], th[1][2]], [c[2] for c in bang])
+check("~ 는 덧그리지 않는다 (탭 본래 색 그대로)", not [c for c in scr.calls if c[0] == "addstr" and c[3] == "~"])
+star = [c for c in scr.calls if c[0] == "addstr" and c[3] == "*"]
+eq("벨 * 덧그리기는 기존 규칙(노란 CP_SESS + 굵게) 그대로", [(bar.CP_SESS << 8) | curses.A_BOLD], [c[4] for c in star])
+eq("벨 * 은 예전 위치 그대로 (끝 패딩 공백 앞 칸 = 클릭 영역 마지막 열 - 1)", [th[3][2] - 1], [c[2] for c in star])
+check("blocked 배지 색 쌍이 init_colors에 등록됨 (흰 글자·빨간 배경)", "CP_BLOCKED, curses.COLOR_WHITE, curses.COLOR_RED" in open(BAR_PATH, encoding="utf-8").read())
+
+# (2) 탭 20개 · 폭 40~200 · 활성 위치 · 접힘/펼침: 상태(idle/working/blocked/섞임)가 바뀌어도 plan_tabs(lo,hi,줄 배치)와
+#     클릭 영역(히트)·그려진 화면 배치가 완전히 같다 (벨 없음) — working↔idle 토글에 탭이 밀리지 않는다
+N20 = ["proj-alpha-%02d" % i if i % 4 else "한글프로젝트이름-%02d" % i for i in range(20)]
+MIX = ["idle", "working", "blocked"]
+
+
+def state_tabs(pattern, active, bells=()):
+    out = []
+    for i, nm in enumerate(N20):
+        sv = MIX[i % 3] if pattern == "mixed" else pattern
+        out.append(st_tab(nm, sv, i in bells, i == active, 200 + i))
+    return out
+
+
+bad_w, bad_plan, bad_hits, bad_cells, runs = [], [], [], [], 0
+for w in (40, 60, 80, 120, 188, 200):
+    for rows in (1, 2):
+        for act in (0, 7, 19):
+            ref = None
+            for pat in ("idle", "working", "blocked", "mixed"):
+                tt = state_tabs(pat, act)
+                widths = [bar.str_width(bar.tab_label(t)) for t in tt]
+                plan = bar.plan_tabs(widths, bar.active_index(tt), bar.strip_caps(w, rows))
+                scr_ = FakeScr(2, w)
+                hh = []
+                bar.draw_strip(scr_, rows, tt, False, hh)
+                cur = (widths, plan, hh)
+                if ref is None:
+                    ref = cur
+                    continue
+                runs += 1
+                tag = "w=%d rows=%d act=%d %s" % (w, rows, act, pat)
+                if cur[0] != ref[0]:
+                    bad_w.append(tag)
+                if (cur[1]["lo"], cur[1]["hi"], cur[1]["lines"], cur[1]["left"], cur[1]["right"]) != (ref[1]["lo"], ref[1]["hi"], ref[1]["lines"], ref[1]["left"], ref[1]["right"]):
+                    bad_plan.append(tag)
+                if cur[2] != ref[2]:
+                    bad_hits.append(tag)
+                # 화면 셀: 배지 한 칸(끝 패딩 자리)만 다르고 나머지 글자 위치는 같다
+                base_scr = FakeScr(2, w)
+                bar.draw_strip(base_scr, rows, state_tabs("idle", act), False, [])
+                diff = [(y, x) for y in range(2) for x in range(w) if scr_.grid[y][x] != base_scr.grid[y][x]]
+                badge_cells = {(y, x1) for (y, x0, x1, a) in hh if a[0] == "tab"}
+                if any(c not in badge_cells for c in diff):
+                    bad_cells.append(tag)
+eq("(2) 탭 20개 × 폭 6종 × 접힘/펼침 × 활성 3곳 × 상태 4패턴: 라벨 폭 목록 동일 (%d회 대조)" % runs, [], bad_w)
+eq("(2) plan_tabs 결과(lo, hi, 줄 배치, ‹N N› 위치)가 idle/working/blocked/섞임 사이에서 동일", [], bad_plan)
+eq("(2) draw_strip 클릭 영역(히트 목록)이 상태와 무관하게 동일", [], bad_hits)
+eq("(2) 화면에서 달라지는 셀은 각 탭 라벨의 마지막 칸(끝 패딩 자리)뿐 — 이름·다른 탭 위치는 안 밀린다", [], bad_cells)
+# 벨 있는 탭이 섞여도 idle ↔ working 은 같다 (벨 * 이 이기므로); blocked 만 벨 탭에서 1칸 줄어든다 (! 가 벨을 이김 — 설계 규칙)
+wi = [bar.str_width(bar.tab_label(t)) for t in state_tabs("idle", 7, bells={2, 3})]
+ww = [bar.str_width(bar.tab_label(t)) for t in state_tabs("working", 7, bells={2, 3})]
+eq("(2) 벨 탭이 섞여도 idle ↔ working 라벨 폭 동일", wi, ww)
+
+# 상태 파일 읽기 (read_agent_states)
+SD = os.path.join(TMP, "agent-state")
+os.environ["CMUX_AGENT_STATE_DIR"] = SD
+NOW = 2_000_000
+
+
+def wf(session, pane, state, ts, tab_name, raw=None):
+    d = os.path.join(SD, session.replace("/", "_"))
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, str(pane)), "w", encoding="utf-8") as f:
+        f.write(raw if raw is not None else "state=%s\nts=%s\ntab=%s\n" % (state, ts, tab_name))
+
+
+eq("상태 디렉터리 없음 → {} (예외 없음)", {}, bar.read_agent_states("nosuch", NOW))
+wf("s1", 1, "working", NOW - 10, "a")
+wf("s1", 2, "blocked", NOW - 5, "a")
+wf("s1", 3, "working", NOW - 301, "b")
+wf("s1", 4, "working", NOW - 300, "c")
+wf("s1", 5, "blocked", NOW - bar.ABANDON_SECS - 1, "d")
+wf("s1", 6, "idle", NOW - bar.ABANDON_SECS, "e")
+wf("s1", 7, "blocked", "x", "f")
+wf("s1", 8, "bogus", NOW, "g")
+wf("s1", 9, "blocked", NOW, "")
+wf("s1", 10, "working", NOW + 100, "h")
+wf("s1", 11, "idle", NOW, "a]*b")
+wf("s1", 12, "idle", NOW - 5, "a")
+wf("s1", "x.tmp", "blocked", NOW, "zz")
+wf("s1", 14, "x", 0, "x", raw="not a state file\n")
+wf("s1", 15, "working", NOW - 20, "한글·codex")
+wf("s1", 16, "blocked", NOW - 1, "w", raw="state=idle\nts=%d\ntab=w\nstate=blocked\n" % (NOW - 1))
+want = {"a": "blocked", "b": "idle", "c": "working", "e": "idle", "h": "working", "a]*b": "idle", "한글·codex": "working", "w": "blocked"}
+eq("롤업: blocked>working>idle · 300초 넘은 working→idle(300초 정각은 working) · 12시간 넘은 파일 무시 · 이상한 파일·.tmp 무시 · 미래 ts 허용 · 마지막 줄 우선",
+   want, bar.read_agent_states("s1", NOW, prune=False))
+check("prune=False: 12시간 넘은 파일을 지우지 않는다", os.path.exists(os.path.join(SD, "s1", "5")))
+bar.read_agent_states("s1", NOW)
+check("prune=True: 12시간 넘은 파일은 삭제, 나머지는 보존", not os.path.exists(os.path.join(SD, "s1", "5")) and os.path.exists(os.path.join(SD, "s1", "6")))
+eq("세션 이름의 / 는 _ 로 (cmux-agent-state와 같은 규칙)", os.path.join(SD, "a_b"), bar.agent_state_dir("a/b"))
+eq("탭 키: 줄바꿈·CR·TAB만 공백으로", "a b c d", bar.tab_key("a\nb\rc\td"))
+eq("env 없으면 $HOME/.config/cmux/agent-state/<세션>", os.path.join(os.environ["HOME"], ".config", "cmux", "agent-state", "q"),
+   (lambda: (os.environ.pop("CMUX_AGENT_STATE_DIR"), bar.agent_state_dir("q"))[1])())
+os.environ["CMUX_AGENT_STATE_DIR"] = SD
+
+# 리더 주입 — 리더가 list-tabs 직후 상태를 캐시에 싣고, 팔로워는 zellij 호출 0회로 캐시에서 읽는다. 옛 캐시도 읽힌다.
+now_i = int(time.time())
+wf("s9", 1, "blocked", now_i, "alpha")
+wf("s9", 2, "working", now_i, "beta")
+RAW9 = [{"position": 0, "name": "alpha", "active": True, "tab_id": 10}, {"position": 1, "name": "beta", "active": False, "tab_id": 11},
+        {"position": 2, "name": "gamma", "active": False, "tab_id": 12}]
+
+
+class CopyFetcher(Fetcher):
+    """매번 새 객체를 돌려준다 (실제 list-tabs처럼 — 리더가 결과에 cmux_state를 싣는 것이 원본 RAW9를 오염시키지 않게)."""
+
+    def __call__(self):
+        self.calls += 1
+        return None if self.raw is None else json.loads(json.dumps(self.raw))
+
+
+cd9 = os.path.join(TMP, "cache9")
+f9l, f9f = CopyFetcher(RAW9), CopyFetcher(RAW9)
+L9 = bar.TabSource("s9", cd9, fetch=f9l, pid=os.getpid())
+F9 = bar.TabSource("s9", cd9, fetch=f9f, pid=os.getpid() + 1_000_000)
+b9 = time.time()
+L9.poll(2.1, b9)
+F9.poll(2.1, b9)
+eq("리더: alpha=blocked, beta=working, gamma(기록 없음)=''", ["blocked", "working", ""], [t["state"] for t in L9.tabs])
+eq("팔로워: 조회 0회, 같은 상태를 캐시에서 읽음", (0, ["blocked", "working", ""]), (f9f.calls, [t["state"] for t in F9.tabs]))
+cache9 = json.load(open(L9.cache_file, encoding="utf-8"))
+eq("캐시 JSON: cmux_state 필드 (기록 없는 탭엔 필드 없음)", ["blocked", "working", None], [t.get("cmux_state") for t in cache9])
+check("원본 list-tabs 결과의 다른 필드는 그대로", [{k: v for k, v in t.items() if k != "cmux_state"} for t in cache9] == RAW9)
+# 상태가 바뀌면 (다음 리더 조회에서) 캐시가 갱신되고 팔로워가 따라온다
+wf("s9", 1, "idle", now_i, "alpha")
+os.unlink(os.path.join(SD, "s9", "2"))
+L9.poll(3.2, b9 + 1.1)
+ch9 = F9.poll(3.2, b9 + 1.1)
+eq("상태 변경: 리더·팔로워 모두 반영 (alpha idle, beta 기록 삭제 → '')", (["idle", "", ""], ["idle", "", ""], True),
+   ([t["state"] for t in L9.tabs], [t["state"] for t in F9.tabs], ch9))
+# 옛 캐시(cmux_state 없음)를 읽는 팔로워
+cd10 = os.path.join(TMP, "cache10")
+old_cache = bar.cache_paths(cd10, "s10")[0]
+os.makedirs(cd10, mode=0o700, exist_ok=True)
+json.dump(RAW9, open(old_cache, "w", encoding="utf-8"))
+F10 = bar.TabSource("s10", cd10, fetch=Fetcher(None), pid=os.getpid() + 2_000_000)
+F10.poll(2.1, time.time())
+eq("옛 캐시(필드 없음): 예외 없이 읽고 state ''", ["", "", ""], [t["state"] for t in (F10.tabs or [])])
+# mark_active(탭 이동 낙관적 갱신)가 캐시의 cmux_state를 지우지 않는다
+L9.mark_active(11)
+eq("mark_active 뒤에도 cmux_state 유지", ["idle", None, None], [t.get("cmux_state") for t in json.load(open(L9.cache_file, encoding="utf-8"))])
+# 상태 읽기가 예외를 내도 탭 줄은 계속
+orig_read = bar.read_agent_states
+bar.read_agent_states = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+fx = CopyFetcher(RAW9)
+LX = bar.TabSource("s11", os.path.join(TMP, "cache11"), fetch=fx, pid=os.getpid())
+raises_nothing("상태 읽기 예외 → 탭 목록은 그대로 갱신", lambda: LX.poll(2.1, time.time()))
+eq("상태 읽기 예외: 탭 3개 (state '')", ["", "", ""], [t["state"] for t in (LX.tabs or [])])
+bar.read_agent_states = orig_read
+os.environ.pop("CMUX_AGENT_STATE_DIR", None)
+
 scenario("Z", "안전장치 — 이 시험 전체에서 실제 zellij 호출 0회")
 eq("실제 zellij 호출(가짜로 바꾸지 않은 경로) 0회", [], REAL_ZELLIJ)

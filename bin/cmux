@@ -879,6 +879,115 @@ _agent_user_args() {
   fi
 }
 
+# ── 에이전트 상태 훅 (cmux-agent-state) ───────────────
+# _state_bin → REPLY = cmux-agent-state 실행 파일. env CMUX_AGENT_STATE_BIN → cmux 옆 → ~/.local/bin. 없으면 비0.
+_state_bin() {
+  local c
+  for c in "${CMUX_AGENT_STATE_BIN:-}" "${CMUX_SELF:h}/cmux-agent-state" "${HOME}/.local/bin/cmux-agent-state"; do
+    [[ -n "$c" && -f "$c" && -x "$c" ]] && { REPLY="$c"; return 0 }
+  done
+  REPLY=""
+  return 1
+}
+
+# _state_hook_args → reply = (--settings <JSON>) — claude에 붙일 상태 훅 설정 (전역 settings는 건드리지 않는다. 훅은 병합된다).
+#   각 이벤트에 동기 훅 1개: `<cmux-agent-state 절대경로> hook <이벤트>` (timeout 5). 경로는 sh용으로 인용한다.
+#   끄기: CMUX_STATE_HOOKS=0. 실행 파일이 없거나 경로에 제어문자가 있으면 reply를 비우고 비0 — 기존 argv는 그대로.
+_state_hook_args() {
+  reply=()
+  [[ "${CMUX_STATE_HOOKS:-1}" == 0 ]] && return 1
+  _state_bin || return 1
+  local bin="$REPLY" ev cmd json="" sep=""
+  [[ "$bin" == *[[:cntrl:]]* ]] && return 1
+  for ev in SessionStart UserPromptSubmit PreToolUse PermissionRequest PostToolUse PostToolUseFailure Notification Stop StopFailure SessionEnd; do
+    cmd="${(qq)bin} hook ${ev}"
+    cmd="${cmd//\\/\\\\}"
+    cmd="${cmd//\"/\\\"}"
+    json+="${sep}\"${ev}\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"${cmd}\",\"timeout\":5}]}]"
+    sep=","
+  done
+  reply=(--settings "{\"hooks\":{${json}}}")
+}
+
+# ── 상태 조회 (cmux status / cmux jump) ───────────────
+# _zj_action <인자...> — 세션 안이면 현재 세션에, 밖이면 -s $SESSION_NAME 에 `zellij action`
+_zj_action() {
+  if [[ -n "$ZELLIJ" ]]; then zellij action "$@"; else zellij -s "$SESSION_NAME" action "$@"; fi
+}
+
+# _live_tabs — 세션의 탭을 위치 순으로 _lt_id / _lt_active(1|0) / _lt_name 평행 배열에 채운다. 못 가져오면 비0.
+#   이름은 줄바꿈·CR·TAB을 공백으로 (cmux-agent-state의 탭 키 규칙과 같다).
+_live_tabs() {
+  _lt_id=() _lt_active=() _lt_name=()
+  local out line
+  out=$(_zj_action list-tabs --json 2>/dev/null) || return 1
+  out=$(print -r -- "$out" | python3 -I -c '
+import json, sys
+try:
+    tabs = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+if not isinstance(tabs, list):
+    sys.exit(1)
+rows = []
+for i, t in enumerate(tabs):
+    if not isinstance(t, dict) or not isinstance(t.get("tab_id"), int):
+        continue
+    pos = t.get("position")
+    name = t.get("name") if isinstance(t.get("name"), str) else ""
+    for c in "\n\r\t":
+        name = name.replace(c, " ")
+    rows.append((pos if isinstance(pos, int) else i, i, t["tab_id"], 1 if t.get("active") else 0, name))
+for _, _, tid, act, name in sorted(rows, key=lambda r: (r[0], r[1])):
+    print("%d\t%d\t%s" % (tid, act, name))
+' 2>/dev/null) || return 1
+  [[ -n "$out" ]] || return 1
+  for line in "${(@f)out}"; do
+    _lt_id+=("${line%%$'\t'*}")
+    line="${line#*$'\t'}"
+    _lt_active+=("${line%%$'\t'*}")
+    _lt_name+=("${line#*$'\t'}")
+  done
+  return 0
+}
+
+# _state_rollup — `cmux-agent-state rollup $SESSION_NAME`의 결과를 _st_tab / _st_state / _st_ts 평행 배열에. 실행 파일이 없으면 비0.
+_state_rollup() {
+  _st_tab=() _st_state=() _st_ts=()
+  _state_bin || return 1
+  local line
+  for line in "${(@f)$("$REPLY" rollup "$SESSION_NAME" 2>/dev/null)}"; do
+    [[ -n "$line" ]] || continue
+    _st_tab+=("${line%%$'\t'*}")
+    line="${line#*$'\t'}"
+    _st_state+=("${line%%$'\t'*}")
+    _st_ts+=("${line#*$'\t'}")
+  done
+  return 0
+}
+
+# _dispw <문자열> → REPLY = 표시 폭 (한글·CJK 같은 넓은 글자는 2칸)
+_dispw() {
+  local s="$1" wide
+  wide="${s//[^가-힣ㄱ-ㆎ一-鿿぀-ヿ＀-｠]/}"
+  REPLY=$(( ${#s} + ${#wide} ))
+}
+
+# _padw <문자열> <폭> → REPLY = 문자열 뒤를 공백으로 채워 표시 폭을 맞춘 것
+_padw() {
+  _dispw "$1"
+  REPLY="$1${(l:$(( $2 - REPLY )):: :)}"
+}
+
+# _fmt_age <초> → REPLY = 경과 시간 (N초 / N분 / N시간 N분)
+_fmt_age() {
+  local s=$(( $1 < 0 ? 0 : $1 ))
+  if (( s < 60 )); then REPLY="${s}초"
+  elif (( s < 3600 )); then REPLY="$(( s / 60 ))분"
+  else REPLY="$(( s / 3600 ))시간 $(( s % 3600 / 60 ))분"
+  fi
+}
+
 # 순서: 실행 파일 확인 → (비-claude) collar-agents-sync → 인자(파일 줄 또는 권한 프로파일) → 핸드오프 마커 소비 →
 # 이어하기 판정 → 배너 1줄(인자 파일 줄을 쓰면 1줄 더) → 실행.
 # 이전 대화가 있으면 이어하기 인자를 붙인다. 이어하기가 곧바로 실패하면(fastfail초 안에 rc 1~128로 종료)
@@ -897,6 +1006,10 @@ _launch_agent() {
   fi
   local bin="$REPLY"
 
+  # 탭 이름 — 에이전트(와 그 훅)가 상태 파일에 이 이름으로 기록한다 (cmux-agent-state, 모든 에이전트)
+  _tab_name "$PWD" "$agent"
+  export CMUX_TAB_NAME="$REPLY"
+
   [[ "$agent" != claude ]] && _collar_agents_sync
 
   local -a perm resume fresh
@@ -910,13 +1023,17 @@ _launch_agent() {
     _agent_call "$agent" perm_args "$REPLY"; perm=("${reply[@]}")
   fi
   _agent_call "$agent" compose fresh "${perm[@]}"; fresh=("${reply[@]}")
+  # claude만: 상태 훅 주입 (--settings). resume·fresh·fastfail 재실행 모두에 붙는다. 실행 파일이 없거나 CMUX_STATE_HOOKS=0 이면 argv 그대로.
+  local -a hookargs
+  [[ "$agent" == claude ]] && _state_hook_args && hookargs=("${reply[@]}")
+  fresh+=("${hookargs[@]}")
 
   local resuming=0 banner
   if _handoff_marker_consume "$agent"; then
     banner="핸드오프 직후 — 새로 시작"
   elif REPLY="" && _agent_call "$agent" has_history "$PWD"; then
     banner="이전 대화 이어서 시작${REPLY:+ [$REPLY]}"
-    _agent_call "$agent" compose resume "${perm[@]}"; resume=("${reply[@]}")
+    _agent_call "$agent" compose resume "${perm[@]}"; resume=("${reply[@]}" "${hookargs[@]}")
     resuming=1
   else
     banner="새로 시작"
@@ -959,6 +1076,8 @@ case "$1" in
     echo "  cmux launch [경로] --agent <에이전트>  (내부용) 그 에이전트 실행 — 이전 대화 있으면 이어서"
     echo "  cmux -a <에이전트> [경로]  에이전트를 골라 열기 (경로 생략 시 현재 폴더, --agent 동의어)"
     echo "  cmux default [에이전트]   기본 에이전트 조회 / 설정 (설정 파일의 CMUX_DEFAULT_AGENT)"
+    echo "  cmux status        탭별 에이전트 상태 표 (blocked → working → idle 순, 기록 없는 탭은 -)"
+    echo "  cmux jump          다음 blocked(입력 대기) 탭으로 이동 — 현재 탭 다음부터 끝에서 처음으로 순환"
     echo ""
     _default_agent
     echo "DEV_ROOT: $DEV_ROOT  (환경변수 CMUX_ROOT 로 변경)"
@@ -967,6 +1086,7 @@ case "$1" in
     echo "에이전트: ${CMUX_AGENTS[*]}  — 기본 $REPLY (${_cmux_default_src%% — *}; 환경변수 CMUX_AGENT > 설정 > claude)"
     echo "설정:     $CMUX_CONFIG_FILE  (zsh로 읽음, 환경변수 CMUX_CONFIG_FILE 로 변경 — 예: CMUX_DEFAULT_AGENT=codex, CMUX_CODEX_PERM=auto)"
     echo "         'cmux <경로>'·picker 선택 기본 = 기본 에이전트, picker는 프로젝트별 마지막 사용 에이전트를 미리 고른다"
+    echo "상태 훅:  cmux가 띄우는 claude에 --settings 훅을 붙여 탭 줄에 배지(! blocked · ~ working)를 그린다 (CMUX_STATE_HOOKS=0 이면 끔, 상태 파일 디렉터리 CMUX_AGENT_STATE_DIR)"
     echo "인자 파일: $AGENT_ARGS_FILE  (환경변수 CMUX_AGENT_ARGS_FILE 로 변경 — 줄마다 '경로|*<TAB>에이전트<TAB>인자'(TAB 필수), 맞는 줄이 권한 인자 대신 — 이어하기 인자(resume --last 등)는 cmux가 붙이니 플래그만 적는다)"
     exit 0
     ;;
@@ -988,6 +1108,74 @@ case "$1" in
     fi
     _ok "기본 에이전트 = $2  (설정: $CMUX_CONFIG_FILE)"
     [[ -n "$CMUX_AGENT" && "$CMUX_AGENT" != "$2" ]] && _warn "지금은 환경변수 CMUX_AGENT=${CMUX_AGENT} 가 우선합니다"
+    exit 0
+    ;;
+
+  status)
+    # 탭별 에이전트 상태 표 — 롤업은 cmux-agent-state rollup 한 곳에서 (cmux-bar 배지와 같은 결과)
+    if ! _state_rollup; then
+      _warn "cmux-agent-state 실행 파일을 찾지 못했습니다 (install.sh 로 설치하거나 환경변수 CMUX_AGENT_STATE_BIN 로 지정)" >&2
+      exit 1
+    fi
+    if ! _live_tabs; then
+      _warn "세션 '${SESSION_NAME}'의 탭 목록을 가져오지 못했습니다 (세션이 없거나 응답 없음)" >&2
+      exit 1
+    fi
+    local -a sname sstate sage
+    local si sj rk st stw=6 sn=$EPOCHSECONDS
+    for rk in blocked working idle -; do          # 표시 순서: blocked → working → idle → 기록 없음(-), 같은 상태 안에서는 탭 순서
+      for si in {1..${#_lt_name}}; do
+        sj=${_st_tab[(ie)${_lt_name[si]}]}
+        if (( sj <= ${#_st_tab} )); then st="${_st_state[sj]}"; else st="-"; fi
+        [[ "$st" == "$rk" ]] || continue
+        sname+=("${_lt_name[si]}") sstate+=("$st")
+        if [[ "$st" == - ]]; then sage+=("-"); else _fmt_age $(( sn - ${_st_ts[sj]} )); sage+=("$REPLY"); fi
+      done
+    done
+    for sj in "${sname[@]}"; do _dispw "$sj"; (( REPLY > stw )) && stw=$REPLY; done
+    _padw "탭" $stw; print -r -- "${REPLY}  상태      경과"
+    print -r -- "${(l:$stw::-:)}  --------  --------"
+    for si in {1..${#sname}}; do
+      _padw "${sname[si]}" $stw
+      print -r -- "${REPLY}  ${(r:8:)sstate[si]}  ${sage[si]}"
+    done
+    exit 0
+    ;;
+
+  jump)
+    # 현재 탭 다음 순서로 처음 만나는 blocked 탭으로 이동 (끝에서 처음으로 순환). 이동은 cmux-bar 탭 클릭과 같은 go-to-tab-by-id.
+    if ! _state_rollup; then
+      _warn "cmux-agent-state 실행 파일을 찾지 못했습니다 (install.sh 로 설치하거나 환경변수 CMUX_AGENT_STATE_BIN 로 지정)" >&2
+      exit 1
+    fi
+    if ! _live_tabs; then
+      _warn "세션 '${SESSION_NAME}'의 탭 목록을 가져오지 못했습니다 (세션이 없거나 응답 없음)" >&2
+      exit 1
+    fi
+    local jn=${#_lt_id} jcur jk ji jj jtarget=0
+    jcur=${_lt_active[(i)1]}                 # 활성 탭 위치(1부터) — 없으면 jn+1
+    (( jcur > jn )) && jcur=0                # 활성 표시가 없으면(클라이언트 없음) 처음부터
+    for (( jk = 1; jk <= jn; jk++ )); do     # 현재 탭 다음 → … → 끝 → 처음 → … → 현재 탭(마지막)
+      ji=$(( (jcur - 1 + jk) % jn + 1 ))
+      jj=${_st_tab[(ie)${_lt_name[ji]}]}
+      if (( jj <= ${#_st_tab} )) && [[ "${_st_state[jj]}" == blocked ]]; then
+        jtarget=$ji
+        break
+      fi
+    done
+    if (( ! jtarget )); then
+      echo "대기 중인 탭이 없습니다"
+      exit 0
+    fi
+    if (( jtarget == jcur )); then           # 다른 blocked 탭이 없고 현재 탭이 그 하나 — 이동하지 않는다
+      echo "이미 blocked 탭입니다: ${_lt_name[jtarget]}"
+      exit 0
+    fi
+    if ! _zj_action go-to-tab-by-id "${_lt_id[jtarget]}" >/dev/null 2>&1; then
+      _warn "탭 이동에 실패했습니다: ${_lt_name[jtarget]}" >&2
+      exit 1
+    fi
+    echo "→ ${_lt_name[jtarget]} (blocked)"
     exit 0
     ;;
 

@@ -2,6 +2,7 @@
 # t06_cmux_bar — bin/cmux-bar 단위 시험 (탭 줄 1↔2줄 토글 설계). zellij 세션·실제 zellij 호출 없음.
 #   W 폭 계산·14칸 자르기·라벨·정규화   P 28탭×188열 창 선택·2줄·경계·좁은 폭   D 가짜 화면 그리기·눌림 영역
 #   L 레거시(내용 1행) = 이전 구현과 같은 출력   S 토글 상태 파일   E 리더 선출·캐시 공유·실패 유지·2초 지연   M 마우스 분류
+#   A 에이전트 상태 배지(우선순위·폭·옛 캐시 호환·상태 파일 읽기·리더 주입)
 # 어서션은 t06_cmux_bar_check.py(`python3 -I`, 확장자 없는 bin/cmux-bar를 SourceFileLoader로 로드)가 하고,
 # 이 래퍼는 그 출력(SCENARIO/PASS/FAIL/SKIP)을 harness 어서션으로 옮긴다.
 # 실제 pane·curses·클릭은 통합 시험 t07_tabbar_toggle이 본다.
@@ -14,7 +15,7 @@ trap 'rm -rf -- "$U_TMP"' EXIT
 
 # 격리: 홈·캐시·상태 파일은 전부 임시 디렉터리 (사용자 ~/.config·$TMPDIR의 cmux-bar-* 를 건드리지 않는다)
 mkdir -p "$U_TMP"/{home,work}
-export HOME="$U_TMP/home" CMUX_TABBAR_STATE_FILE="$U_TMP/work/rows" CMUX_BAR_CACHE_DIR="$U_TMP/work/cache"
+export HOME="$U_TMP/home" CMUX_TABBAR_STATE_FILE="$U_TMP/work/rows" CMUX_BAR_CACHE_DIR="$U_TMP/work/cache" CMUX_AGENT_STATE_DIR="$U_TMP/work/agent-state"
 
 # 레거시 비교용 이전 구현 (이 변경 직전 커밋). 없으면 비교만 SKIP
 OLD_REV="${T_OLD_BAR_REV:-8ca08a8}"

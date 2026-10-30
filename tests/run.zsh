@@ -25,7 +25,7 @@ _record() {  # <이름> <rc> [상세]
 # ── 구문검사 ──────────────────────────────────────────
 print "== 구문검사"
 syntax_rc=0
-for f in "$REPO/bin/cmux" "$REPO/bin/cmux-agents.zsh" "$REPO"/tests/**/*.zsh(N); do
+for f in "$REPO/bin/cmux" "$REPO/bin/cmux-agents.zsh" "$REPO/bin/cmux-agent-state" "$REPO"/tests/**/*.zsh(N); do
   zsh -n "$f" || { print -u2 "  구문 오류: $f"; syntax_rc=1; }
 done
 if [[ -n "$CMUX_UNDER_TEST" && "${CMUX_UNDER_TEST:A}" != "$REPO/bin/cmux" ]]; then
