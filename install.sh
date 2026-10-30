@@ -96,6 +96,7 @@ _info "바이너리 설치 중..."
 _install_bin "${SCRIPT_DIR}/bin/cmux-agents.zsh" "${BIN_DIR}/cmux-agents.zsh"
 _install_bin "${SCRIPT_DIR}/bin/cmux-picker"     "${BIN_DIR}/cmux-picker"
 _install_bin "${SCRIPT_DIR}/bin/cmux-bar"        "${BIN_DIR}/cmux-bar"
+_install_bin "${SCRIPT_DIR}/bin/cmux-agent-state" "${BIN_DIR}/cmux-agent-state"
 _install_bin "${SCRIPT_DIR}/bin/cmux"            "${BIN_DIR}/cmux"
 
 # ── zellij 설정 설치 ──────────────────────────────────
