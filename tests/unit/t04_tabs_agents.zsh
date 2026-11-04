@@ -29,8 +29,8 @@ unset CMUX_AGENT CMUX_DEFAULT_AGENT
 # PATH 맨 앞의 가짜 zellij — 호출만 기록하고 exit 1 (세션 없음 → 콜드 경로, 클라이언트 실행은 즉시 실패)
 print -r -- $'#!/bin/sh\necho "$*" >> "'"$U_TMP"$'/zellij-calls"\nexit 1' > "$U_TMP/bin/zellij"
 chmod +x "$U_TMP/bin/zellij"
-for a in claude codex opencode; do ln -s "$T_REPO/tests/bin/fake-agent" "$U_TMP/bin/fake-$a"; done
-export CMUX_CLAUDE_BIN="$U_TMP/bin/fake-claude" CMUX_CODEX_BIN="$U_TMP/bin/fake-codex" CMUX_OPENCODE_BIN="$U_TMP/bin/fake-opencode"
+for a in claude codex opencode kimi; do ln -s "$T_REPO/tests/bin/fake-agent" "$U_TMP/bin/fake-$a"; done
+export CMUX_CLAUDE_BIN="$U_TMP/bin/fake-claude" CMUX_CODEX_BIN="$U_TMP/bin/fake-codex" CMUX_OPENCODE_BIN="$U_TMP/bin/fake-opencode" CMUX_KIMI_BIN="$U_TMP/bin/fake-kimi"
 export FAKE_AGENT_LOG="$U_TMP/fake-agent.log" FAKE_AGENT_SLEEP=0
 print -r -- $'#!/bin/sh\nprintf "[bar]"' > "$U_TMP/bin/bar-stub"
 chmod +x "$U_TMP/bin/bar-stub"
@@ -218,7 +218,7 @@ _cm default codex >/dev/null
 t_assert_eq "줄이 없으면 끝에 추가" "$(_lines "FOO=1" "CMUX_DEFAULT_AGENT=codex")" "$(cat "$CMUX_CONFIG_FILE")"
 sum0="$(md5 -q "$CMUX_CONFIG_FILE")"
 out="$(_cm default nope; print -r -- "rc=$?")"
-t_assert_contains "미등록 에이전트 → 오류 + 사용 가능 목록" "$out" "알 수 없는 에이전트: 'nope' (사용 가능: claude codex opencode)"
+t_assert_contains "미등록 에이전트 → 오류 + 사용 가능 목록" "$out" "알 수 없는 에이전트: 'nope' (사용 가능: claude codex opencode kimi)"
 t_assert_contains "미등록 에이전트 → exit 1" "$out" "rc=1"
 t_assert_eq "미등록 에이전트 → 파일 그대로" "$sum0" "$(md5 -q "$CMUX_CONFIG_FILE")"
 out="$(CMUX_AGENT=claude _cm default opencode)"
@@ -313,7 +313,7 @@ chmod 755 "$U_TMP/rolayouts"
 t_scenario S7 "cmux -a / --agent / cmux <경로> (콜드 경로, 가짜 zellij)"
 rm -f -- "$TABS_FILE" "$TABS_FILE".bak-*(N) "$CMUX_PROJECT_AGENTS_FILE" "$U_TMP/zellij-calls"
 out="$(_cm -a bogus "$A"; print -r -- "rc=$?")"
-t_assert_contains "미등록 에이전트 → 오류 + 사용 가능 목록" "$out" "알 수 없는 에이전트: 'bogus' (사용 가능: claude codex opencode)"
+t_assert_contains "미등록 에이전트 → 오류 + 사용 가능 목록" "$out" "알 수 없는 에이전트: 'bogus' (사용 가능: claude codex opencode kimi)"
 t_assert_contains "미등록 에이전트 → exit 1" "$out" "rc=1"
 out="$(_cm -a; print -r -- "rc=$?")"
 t_assert_contains "에이전트 생략 → 오류·exit 1" "$out" "사용법: cmux -a <에이전트> [경로]"$'\n'"rc=1"
@@ -383,9 +383,9 @@ CMUX_PICKER_BIN="$U_TMP/bin/stub-picker"
 : > "$U_TMP/picker-out"
 _penv() { ( unset _cmux_default_agent; _pick >/dev/null; cat "$U_TMP/picker-env" ) 2>/dev/null; }
 t_assert_eq "env 3종 + CMUX_ROOT (전부 설치·default claude)" \
-  "AGENTS=claude codex opencode|DEFAULT=claude|PREFS=$CMUX_PROJECT_AGENTS_FILE|ROOT=$DEV_ROOT" "$(_penv)"
-t_assert_eq "미설치 에이전트(opencode) 제외" "AGENTS=claude codex|DEFAULT=claude" "$(CMUX_OPENCODE_BIN=/nonexistent/opencode _penv | cut -d'|' -f1-2)"
-t_assert_eq "default는 미설치여도 포함, 등록 순서 유지" "AGENTS=codex opencode|DEFAULT=codex" \
+  "AGENTS=claude codex opencode kimi|DEFAULT=claude|PREFS=$CMUX_PROJECT_AGENTS_FILE|ROOT=$DEV_ROOT" "$(_penv)"
+t_assert_eq "미설치 에이전트(opencode) 제외" "AGENTS=claude codex kimi|DEFAULT=claude" "$(CMUX_OPENCODE_BIN=/nonexistent/opencode _penv | cut -d'|' -f1-2)"
+t_assert_eq "default는 미설치여도 포함, 등록 순서 유지" "AGENTS=codex opencode kimi|DEFAULT=codex" \
   "$(CMUX_CLAUDE_BIN=/nonexistent/claude CMUX_CODEX_BIN=/nonexistent/codex CMUX_AGENT=codex _penv | cut -d'|' -f1-2)"
 
 # _pick_flow — _open_one/_open_many 기록 스텁
@@ -435,7 +435,7 @@ t_assert_contains "default 항목" "$out" "cmux default [에이전트]"
 t_assert_contains "launch --agent 항목" "$out" "cmux launch [경로] --agent <에이전트>"
 t_assert_contains "기존 launch 줄 유지" "$out" "cmux launch [경로] (내부용) Claude Code 실행 — 대화 기록 있으면 --continue"
 t_assert_contains "설정 파일 안내" "$out" "설정:     $CMUX_CONFIG_FILE"
-t_assert_contains "기본 에이전트 안내" "$out" "에이전트: claude codex opencode  — 기본 claude (기본값; 환경변수 CMUX_AGENT > 설정 > claude)"
+t_assert_contains "기본 에이전트 안내" "$out" "에이전트: claude codex opencode kimi  — 기본 claude (기본값; 환경변수 CMUX_AGENT > 설정 > claude)"
 t_assert_not_contains "sync/close-tab은 P2-C 몫 — 아직 없음" "$out" "close-tab"
 
 t_summary

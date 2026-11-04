@@ -89,6 +89,7 @@ cmux -k              # 세션 재시작 — 같은 탭 복원 + 각 탭 Claude �
 cmux kill            # 세션 종료만 (탭 기록 보존 → 다음 cmux가 복원)
 cmux status          # 탭별 에이전트 상태 표 (blocked → working → idle 순, 기록 없는 탭은 -)
 cmux jump            # 다음 blocked(입력 대기) 탭으로 이동 — 현재 탭 다음부터 끝에서 처음으로 순환
+cmux bridge [--check|--apply] [경로]   # AGENTS.md ↔ CLAUDE.md 지침 파일 연결 (아래 "에이전트와 지침 파일")
 ```
 
 `cmux -k`를 세션 안(터미널 pane)에서 실행하면 세션이 종료된 직후 같은 터미널에서 자동으로 같은 탭이 다시 만들어집니다. 이 자동 복원은 `cmux`로 세션을 열었을 때 동작하며, `zellij attach`로 직접 붙은 경우에는 셸에서 `cmux`를 한 번 더 실행하면 됩니다. 세션이 죽은 상태에서 `cmux <경로>`를 실행하면 이전 탭들도 함께 복원되고 지정한 경로가 새 탭으로 추가됩니다(기록을 버리고 새로 시작하려면 `cmux pick`).
@@ -141,6 +142,30 @@ cmux jump            # 다음 blocked(입력 대기) 탭으로 이동 — 현재
 >
 > 세션이 살아있으면 다음에 `cmux` 실행 시 picker 없이 바로 재연결됩니다. 세션이 죽었으면 마지막 탭 구성을 그대로 복원하고 각 탭의 Claude 대화를 이어갑니다.
 
+### 에이전트와 지침 파일
+
+`cmux -a <에이전트> [경로]`(또는 피커)로 탭마다 다른 CLI를 쓸 수 있습니다. 내장: `claude`(기본) · `codex` · `opencode` · `kimi`(Kimi Code). 탭 이름은 `프로젝트·에이전트`, 세션 복원(`session-tabs`)도 에이전트를 기억합니다.
+
+| 에이전트 | 실행 파일 탐색 | 권한 기본(`CMUX_<이름>_PERM`) | 이어하기 |
+|----------|----------------|------------------------------|----------|
+| kimi | `CMUX_KIMI_BIN` → `~/.kimi-code/bin/kimi` → `~/.local/bin/kimi` → PATH | safe=`--yolo`(Ask When Needed), auto=`--auto`(Never Ask) | `--continue` — 세션이 없는 폴더에서는 kimi가 "No sessions to continue …; starting a fresh session." 하고 새 대화로 시작(2.4.1 실측) |
+
+- **Kimi 메모**: 처음 가는 폴더는 kimi가 "Trust this folder?"를 먼저 묻습니다 — cmux는 대신 답하지 않습니다. 시작 배너의 `[MM-DD HH:MM]`은 `kimi session list --cwd <폴더> --json --limit 1`(8초 제한)의 마지막 갱신 시각이고, 못 읽으면 `[이력이 없으면 새 대화]`입니다. `kimi import-sessions`(다른 CLI 세션 가져오기)는 전역 명령이라 cmux가 부르지 않습니다. **미확인**: Kimi Code가 프로젝트의 `AGENTS.md`를 읽는지(문서에는 전역 `~/.kimi-code/AGENTS.md`·`~/.agents/AGENTS.md`만 있고, 로그인이 필요해 실측하지 못했습니다) — 그래서 아래 연결은 어느 쪽이든 동작하는 포인터 방식입니다.
+- **지침 파일 연결**: Claude Code는 `CLAUDE.md`만(`@경로` 임포트 지원), codex는 `AGENTS.md`만, opencode는 `AGENTS.md` 우선(없으면 `CLAUDE.md`)을 읽습니다. 어느 CLI로 열든 같은 지침을 보게 하려고 cmux가 시작할 때 현재 폴더를 살핍니다(순수 zsh 파일 검사, 실패해도 시작은 계속). **자동 생성은 `.collar/`가 있는 프로젝트에서, 지금 실행하는 에이전트가 필요로 하는 파일 한 방향만** 합니다 — claude는 `AGENTS.md`만 있을 때 `CLAUDE.md`를, 그 밖의 에이전트(codex·opencode·kimi 등)는 `CLAUDE.md`만 있을 때 `AGENTS.md`를 만듭니다. 반대 방향은 그 에이전트가 이미 자기 파일을 읽으니 쓰지 않아서, 예를 들어 `cmux -k`로 탭 수십 개를 복원해도 claude 탭 때문에 프로젝트마다 `AGENTS.md`가 새로 생기지 않습니다. 양방향 연결은 `cmux bridge --apply`로 명시합니다.
+
+| 상태 | `.collar/` 있음 — claude 시작 | `.collar/` 있음 — 비-claude 시작 | `.collar/` 없음 — claude 시작 | `.collar/` 없음 — 비-claude 시작 | `cmux bridge --apply` |
+|------|------|------|------|------|------|
+| `AGENTS.md`만 | `CLAUDE.md` 신규 생성(`@AGENTS.md` + 마커 `<!-- cmux:bridge -->`) | 쓰기·안내 없음(AGENTS.md를 이미 읽음) | 안내 한 줄만 | 쓰기·안내 없음 | `CLAUDE.md` 생성 |
+| `CLAUDE.md`만 | 쓰기·안내 없음(CLAUDE.md를 이미 읽음) | `AGENTS.md` 신규 생성("CLAUDE.md를 처음부터 끝까지 읽어라" 포인터 + 마커) — 그 뒤 `collar-agents-sync`가 최상단에 collar 블록 삽입 | 쓰기·안내 없음 | 안내 한 줄만 | `AGENTS.md` 생성 |
+| 둘 다, 서로 참조 | 연결됨 — 아무것도 안 함 | 연결됨 | 연결됨 | 연결됨 | 연결됨 |
+| 둘 다, 참조 없음 | 안내 한 줄만(자동 수정 없음) | 안내 한 줄만 | 안내 한 줄만 | 안내 한 줄만 | `CLAUDE.md` 끝에 `@AGENTS.md`, `AGENTS.md` 끝에 CLAUDE.md 포인터를 마커 블록(`<!-- cmux:bridge begin -->…<!-- cmux:bridge end -->`)으로 추가 |
+| 둘 다 없음 | 아무것도 안 함 | 아무것도 안 함 | 아무것도 안 함 | 아무것도 안 함 | 안내만 |
+
+  **안내 한 줄도 같은 원칙**입니다: 지금 실행하는 에이전트가 읽는 파일이 이미 있으면 조용합니다(claude는 `CLAUDE.md`, 그 밖은 `AGENTS.md`). 안내는 그 에이전트가 읽지 못하는 파일인데 `.collar/`가 없어 만들지 않은 경우와, 둘 다 있지만 서로 가리키지 않아 어느 에이전트에게나 실제 공백인 경우에만 나옵니다(`cmux bridge --apply <경로>`로 연결). `cmux bridge --check`는 에이전트와 무관하게 상태 전체를 보여줍니다.
+
+  참조 판정은 단순 규칙입니다: `CLAUDE.md`에 `@AGENTS.md`(또는 `@./AGENTS.md`)가 있거나 `AGENTS.md`에 `CLAUDE.md` 문자열이 있거나 두 파일이 같은 파일(심볼릭 링크)이면 연결됨. `cmux bridge`는 기본이 `--check`(쓰기 없음)이며 종료코드는 0 연결됨·할 일 없음·적용 성공 / 10 연결 필요 / 2 마커 손상(무변경) / 3 심볼릭 링크 등 안전하지 않음(무변경) / 1 사용법·입출력 오류입니다. 이미 있는 파일은 블록 밖 바이트를 건드리지 않고(원본 + 블록 추가만), 쓰기는 같은 폴더 임시파일 → `mv`로 원자적이며 원 파일 모드를 유지하고, 다시 실행해도 변하지 않습니다. 새 파일은 `git add`/커밋/ignore를 하지 않으니 사용자가 정하세요.
+- **새 CLI 붙이기(확장점)**: `~/.config/cmux/agents.d/*.zsh`(환경변수 `CMUX_AGENTS_D`)가 있으면 내장 정의 뒤에 source 됩니다. 파일에서 `CMUX_AGENTS+=(이름)`과 `_ag_<이름>_<훅>` 함수(`bin`·`perm_args`·`resume_args`·`has_history` 등, 목록은 `bin/cmux-agents.zsh` 맨 위)를 정의하면 새 에이전트가 등록됩니다. 이미 있는 이름의 중복 등록은 경고 후 무시되고(내장 어댑터를 덮어쓰지 못함), 문법 오류 파일은 경고 1줄 후 건너뜁니다. 견본(활성화되지 않음): `doc/agents.d/grok.zsh.example` — Grok은 바이너리·접근권·플래그를 확인하지 못해 어댑터를 만들지 않았고, 견본에는 공식 문서로 확인 후 채울 자리만 있습니다.
+
 ## 설정
 
 ### 프로젝트 루트 변경
@@ -178,6 +203,8 @@ cmux/
 │   ├── cmux-bar         # 상단 탭 줄 + 툴바, 1↔2줄 토글 (Python curses)
 │   ├── cmux-agent-state # 에이전트 상태 훅·롤업 (zsh) — 탭 배지, cmux status/jump
 │   └── cmux-picker      # 커서 기반 피커 (Python)
+├── doc/
+│   └── agents.d/grok.zsh.example   # 새 에이전트 CLI 등록 견본 (~/.config/cmux/agents.d/ 로 복사해 채움)
 ├── zellij/
 │   ├── config.kdl        # zellij 메인 설정
 │   └── layouts/

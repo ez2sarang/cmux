@@ -52,7 +52,7 @@ t_assert_true "alpha claude·beta codex 실행" \
   '(( $(t_agent_launches claude "$ALPHA") == 1 && $(t_agent_launches codex "$BETA") == 1 ))' 30
 _assert_eventually "탭 = alpha, beta·codex" $'alpha\nbeta·codex' t_tab_names 20
 t_assert_eq "picker env: 등록·설치 에이전트, default claude, 기억 파일, CMUX_ROOT" \
-  "AGENTS=claude codex opencode|DEFAULT=claude|PREFS=$CMUX_PROJECT_AGENTS_FILE|ROOT=$CMUX_ROOT" "$(_last_env)"
+  "AGENTS=claude codex opencode kimi|DEFAULT=claude|PREFS=$CMUX_PROJECT_AGENTS_FILE|ROOT=$CMUX_ROOT" "$(_last_env)"
 t_assert_eq "picker 1회 호출" 1 "$(grep -c . "$PICKER_ENV")"
 t_assert_eq "alpha: claude (이력 없음)" "$PERM" "$(t_agent_args claude "$ALPHA")"
 t_assert_eq "beta: codex resume --last + safe" "resume --last $SAFE" "$(t_agent_args codex "$BETA")"
@@ -69,7 +69,7 @@ CMUX_OPENCODE_BIN="$T_ROOT/bin/no-such-opencode" t_cmux_bg 120 pick
 t_assert_true "gamma claude 실행 (default)" '(( $(t_agent_launches claude "$GAMMA") == 1 ))' 20
 _assert_eventually "탭 = alpha, beta·codex, gamma" $'alpha\nbeta·codex\ngamma' t_tab_names 20
 t_assert_true "탭 추가 백그라운드 작업 종료" '(( $(t_cmux_procs pick) == 1 ))' 20
-t_assert_eq "미설치 opencode는 picker env에서 제외" "AGENTS=claude codex|DEFAULT=claude" "$(_last_env | cut -d'|' -f1-2)"
+t_assert_eq "미설치 opencode는 picker env에서 제외" "AGENTS=claude codex kimi|DEFAULT=claude" "$(_last_env | cut -d'|' -f1-2)"
 t_assert_contains "미등록 에이전트 → 경고 1줄" "$(cat "$T_LAST_LOG")" "알 수 없는 에이전트 'bogus' — 기본 에이전트(claude)로 엽니다: gamma"
 t_assert_eq "session-tabs 뒤에 gamma (claude 평문)" "$ALPHA"$'\n'"$BETA${T}codex"$'\n'"$GAMMA" "$(t_tabs_file)"
 t_assert_eq "기존 탭 재실행 없음" "1 1" "$(t_agent_launches claude "$ALPHA") $(t_agent_launches codex "$BETA")"
@@ -83,7 +83,7 @@ t_cmux_bg 120 pick
 t_assert_true "delta codex 실행" '(( $(t_agent_launches codex "$DELTA") == 1 ))' 20
 _assert_eventually "탭 = …, delta·codex" $'alpha\nbeta·codex\ngamma\ndelta·codex' t_tab_names 20
 t_assert_true "탭 추가 백그라운드 작업 종료" '(( $(t_cmux_procs pick) == 1 ))' 20
-t_assert_eq "picker env DEFAULT=codex" "AGENTS=claude codex opencode|DEFAULT=codex" "$(_last_env | cut -d'|' -f1-2)"
+t_assert_eq "picker env DEFAULT=codex" "AGENTS=claude codex opencode kimi|DEFAULT=codex" "$(_last_env | cut -d'|' -f1-2)"
 t_assert_eq "delta: codex resume --last + safe" "resume --last $SAFE" "$(t_agent_args codex "$DELTA")"
 t_assert_eq "delta에 claude 실행 없음" 0 "$(t_agent_launches claude "$DELTA")"
 t_assert_eq "session-tabs 뒤에 delta<TAB>codex" "$ALPHA"$'\n'"$BETA${T}codex"$'\n'"$GAMMA"$'\n'"$DELTA${T}codex" "$(t_tabs_file)"

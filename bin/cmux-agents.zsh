@@ -11,13 +11,15 @@
 #   compose <resume|fresh> <권한 인자...>  실행 인자 전체 → reply 배열 (기본: 권한 인자 + resume_args/fresh_args)
 #   fastfail              이 시간(초) 안에 이어하기가 비0 종료하면 새 대화로 1회 재실행 → REPLY
 #   label                 표시 이름 → REPLY
+# 확장: ${CMUX_AGENTS_D:-~/.config/cmux/agents.d}/*.zsh 가 내장 정의 뒤에 source 된다 (맨 아래 _ag_load_extensions).
+#   그 파일에서 CMUX_AGENTS+=(이름) 과 위 훅을 정의하면 새 에이전트가 등록된다 — 견본: doc/agents.d/grok.zsh.example
 # install.sh도 source 하므로(set -u) 미설정 변수는 기본값 문법으로 읽는다.
 
 zmodload zsh/datetime            # strftime, EPOCHSECONDS (bin/cmux의 핸드오프 마커 판정도 쓴다)
 zmodload -F zsh/stat b:zstat     # zstat만 — 외부 stat 명령은 가리지 않는다
 
 # 등록된 에이전트 — 기본 에이전트는 claude
-CMUX_AGENTS=(claude codex opencode)
+CMUX_AGENTS=(claude codex opencode kimi)
 
 _agent_known() {
   [[ -n "$1" ]] && (( ${CMUX_AGENTS[(Ie)$1]} ))
@@ -319,3 +321,161 @@ _ag_opencode_last_activity() {
 }
 # 없는 id면 'opencode -s'가 rc=1로 즉시 끝난다(S4) → fastfail(기본 5초)로 새 대화 1회
 _ag_opencode_resume_args() { reply=(-s "$_ag_opencode_sid") }
+
+# ── kimi (Kimi Code CLI) ──────────────────────────────
+_ag_kimi_label() { REPLY="Kimi Code" }
+
+# 바이너리 탐색: CMUX_KIMI_BIN → ~/.kimi-code/bin/kimi(공식 설치 위치) → ~/.local/bin/kimi(심볼릭 링크) → PATH
+_ag_kimi_bin() {
+  _ag_search_bin kimi "$HOME/.kimi-code/bin/kimi" "$HOME/.local/bin/kimi"
+}
+
+# 기본 safe — 가드 훅이 없는 CLI는 전면 우회를 기본으로 하지 않는다 (codex와 같은 이유).
+#   safe = --yolo (Ask When Needed: 일상 편집·명령은 자동, 위험 작업·질문·플랜은 확인)
+#   auto = --auto (Never Ask: 전부 자동 결정, 플랜 모드의 플랜만 검토 대기)
+# 'kimi --yolo --continue'·'kimi --auto --continue' 모두 인자 오류 없이 뜬다(2.4.1 실측). --prompt(비대화)와는 함께 못 쓰지만 cmux는 --prompt를 쓰지 않는다.
+_ag_kimi_default_perm() { REPLY=safe }
+_ag_kimi_perm_args() {
+  if [[ "$1" == "auto" ]]; then
+    reply=(--auto)
+  else
+    reply=(--yolo)
+  fi
+}
+
+# 이어하기는 kimi가 판정한다(native, codex 방식) — 항상 '--continue'. 2.4.1 실측(2026-11-04, KIMI_CODE_HOME·HOME을 임시 폴더로 격리, pty,
+# 로그인 전): 세션이 없는 폴더의 'kimi --continue'는 실패하지 않고 TUI가 살아서 "No sessions to continue under <폴더>; starting a
+# fresh session." 한 줄을 보인 뒤 새 입력창으로 시작한다(14초 생존, 즉시 종료 없음) → opencode식 fastfail·이력 프로브 분기가 필요 없다.
+#   · 처음 가는 폴더는 먼저 "Trust this folder?"가 뜬다 — cmux가 대신 답하지 않는다(codex trust 프롬프트와 같은 방침). 거기서 Exit 하면 rc=0이라
+#     fastfail(rc 1~128만 재실행)에도 걸리지 않는다.
+#   · 세션 저장은 ${KIMI_CODE_HOME:-~/.kimi-code}/sessions/<workDirKey>/<id>/ — 폴더 단위. 'kimi import-sessions'는 전역·무인자라 cmux가 부르지 않는다.
+#   · 미확인: 로그인한 상태의 --continue 동작(세션 판정은 인증 이전이라 같다고 보지만 로그인 후 실측은 못 했다).
+_ag_kimi_resume_args() { reply=(--continue) }
+# fresh_args·fastfail: 기본 구현 (인자 없음 / 5초 — 'kimi' 자체가 5초 안에 오류로 죽을 때만 새 대화로 1회 재실행)
+
+# 마지막 활동(배너 설명·핸드오프 마커 유예 판정용): 'kimi session list --cwd <dir> --json --limit 1'(8초 제한).
+# --cwd는 기록된 workDir과 문자열 그대로 비교한다(실측: 심볼릭 링크 경로 /tmp/x는 못 찾고 realpath /private/tmp/x는 찾음) →
+# 조회 전에 chdir해서 커널이 말하는 물리 경로(os.getcwd)를 넘긴다 — kimi가 세션을 기록할 때 쓰는 값과 같다.
+# JSON 모양(2.4.1 실측): 최근 갱신순 배열 [{id, workDir, sessionDir, createdAt(ms), updatedAt(ms), archived, metadata}], 없으면 [].
+# 필드명이 바뀌어도 죽지 않게 방어적으로 읽는다: 목록(또는 목록을 값으로 가진 객체)이 비어 있지 않으면 이력 있음, 시각은
+# updatedAt/updated_at/updated/…를 차례로 시도하고 ms·초·ISO 문자열을 모두 받아 초로 바꾸며 못 읽으면 0.
+# 결과: _ag_kimi_count(보관되지 않은 세션 수), _ag_kimi_updated(epoch 초, 없으면 0).
+# 실패·시간 초과·파싱 오류·python3 없음은 조용히 "없음"(0 0).
+typeset -g _ag_kimi_count=0 _ag_kimi_updated=0
+_ag_kimi_probe() {
+  local dir="${1:-$PWD}" out
+  _ag_kimi_count=0 _ag_kimi_updated=0
+  _agent_call kimi bin || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  out="$(python3 -I -c '
+import json, os, subprocess, sys
+from datetime import datetime, timezone
+b, d = sys.argv[1], sys.argv[2]
+def secs(v):
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, str):
+        s = v.strip()
+        try:
+            v = float(s)
+        except ValueError:
+            try:
+                t = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except ValueError:
+                return 0
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            return int(t.timestamp())
+    if isinstance(v, (int, float)) and v > 0:
+        return int(v / 1000) if v > 1e11 else int(v)
+    return 0
+try:
+    os.chdir(d)
+    r = subprocess.run([b, "session", "list", "--cwd", os.getcwd(), "--json", "--limit", "1"],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8)
+    if r.returncode:
+        sys.exit(0)
+    data = json.loads(r.stdout)
+    if isinstance(data, dict):
+        data = next((v for v in data.values() if isinstance(v, list)), [])
+    if not isinstance(data, list):
+        sys.exit(0)
+    items = [s for s in data if not (isinstance(s, dict) and s.get("archived") is True)]
+    t = 0
+    for s in items:
+        if isinstance(s, dict):
+            for k in ("updatedAt", "updated_at", "updated", "lastActiveAt", "last_active_at", "createdAt", "created_at", "created"):
+                if secs(s.get(k)):
+                    t = max(t, secs(s.get(k)))
+                    break
+    print(len(items), t)
+except Exception:
+    pass
+' "$REPLY" "$dir" 2>/dev/null)"
+  local -a f=(${=out})
+  (( ${#f} == 2 )) && [[ "${f[1]}" == <-> && "${f[2]}" == <-> ]] || return 1
+  _ag_kimi_count="${f[1]}" _ag_kimi_updated="${f[2]}"
+}
+_ag_kimi_last_activity() {
+  _ag_kimi_probe "${1:-$PWD}"
+  REPLY="$_ag_kimi_updated"
+}
+# native: 이력이 없어도 항상 0(= '--continue'로 시작, 없으면 kimi가 새 대화). 배너 설명만 프로브 결과를 쓴다.
+_ag_kimi_has_history() {
+  _ag_kimi_probe "${1:-$PWD}"
+  if (( _ag_kimi_updated )); then
+    _ag_fmt_time "$_ag_kimi_updated"
+  elif (( _ag_kimi_count )); then
+    REPLY="이력 있음"
+  else
+    REPLY="이력이 없으면 새 대화"
+  fi
+  return 0
+}
+
+# ── 확장점: agents.d ──────────────────────────────────
+# ${CMUX_AGENTS_D:-$HOME/.config/cmux/agents.d}/*.zsh 를 위 내장 정의 뒤에 source 한다 — 새 CLI(grok 등)를 이 파일들로 붙인다.
+# 파일에서 CMUX_AGENTS+=(이름) 으로 등록하고 _ag_<이름>_<훅> 함수(맨 위 목록)를 정의한다. 견본: doc/agents.d/grok.zsh.example
+#   · 디렉토리나 *.zsh 가 없으면 아무 일도 하지 않는다(프로세스 생성 없음).
+#   · 이름은 [a-z][a-z0-9_]* (함수·환경변수 CMUX_<이름>_BIN·탭 이름·레이아웃 파일명에 쓰이므로), 'default'는 쓸 수 없다. 어긴 이름은 경고 후 등록하지 않는다.
+#   · 이미 등록된 이름(내장·앞선 파일)을 다시 등록하면 경고 후 무시한다 — 그 이름의 _ag_<이름>_* 함수도 파일을 읽기 전 상태로 되돌려 내장 어댑터를 덮어쓰지 못한다.
+#   · 등록은 추가(+=)만 반영된다: CMUX_AGENTS=(…) 로 통째로 바꿔도 내장 에이전트는 사라지지 않는다.
+#   · 문법 오류가 있는 파일은 `zsh -n` 으로 먼저 걸러 경고 1줄 후 통째로 건너뛴다(일부만 등록되는 일 없음) — cmux 전체가 죽지 않는다.
+#   · 함수 안에서 source 되므로 파일이 상태 변수를 두려면 `typeset -g` 로 선언한다.
+#   · install.sh(set -euo)도 이 파일을 source 하므로 어떤 경로로도 비0을 새게 하지 않는다.
+_ag_load_extensions() {
+  emulate -L zsh
+  setopt extended_glob
+  local dir="${CMUX_AGENTS_D:-${HOME:-}/.config/cmux/agents.d}" f n fn
+  local -a files=("$dir"/*.zsh(N-.)) before added
+  local -A saved
+  (( ${#files} )) || return 0
+  for f in "${files[@]}"; do
+    if ! zsh -n -- "$f" 2>/dev/null; then
+      print -u2 -r -- "! cmux: ${f} 문법 오류 — 이 에이전트 확장을 건너뜁니다"
+      continue
+    fi
+    before=("${CMUX_AGENTS[@]}")
+    saved=()
+    for fn in ${(k)functions[(I)_ag_*]}; do saved[$fn]="${functions[$fn]}"; done
+    source "$f"
+    added=("${(@)CMUX_AGENTS[$(( ${#before} + 1 )),-1]}")
+    CMUX_AGENTS=("${before[@]}")
+    for n in "${added[@]}"; do
+      if [[ "$n" != [a-z][a-z0-9_]# || "$n" == default ]]; then
+        print -u2 -r -- "! cmux: ${f:t} — 에이전트 이름 '${n}' 은 [a-z][a-z0-9_]* 이어야 해서 등록하지 않습니다"
+        continue
+      fi
+      if (( ${CMUX_AGENTS[(Ie)$n]} )); then
+        print -u2 -r -- "! cmux: ${f:t} — 이미 등록된 에이전트 '${n}' 의 중복 등록을 무시합니다"
+        for fn in ${(k)functions[(I)_ag_${n}_*]}; do
+          if (( ${+saved[$fn]} )); then functions[$fn]="${saved[$fn]}"; else unfunction -- "$fn"; fi
+        done
+        continue
+      fi
+      CMUX_AGENTS+=("$n")
+    done
+  done
+  return 0
+}
+_ag_load_extensions || true

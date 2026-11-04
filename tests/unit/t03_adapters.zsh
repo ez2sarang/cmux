@@ -74,14 +74,14 @@ PERM="--dangerously-skip-permissions"
 
 # ── A1 ────────────────────────────────────────────────
 t_scenario A1 "등록·훅 기본값"
-t_assert_eq "등록 에이전트" "claude codex opencode" "${CMUX_AGENTS[*]}"
+t_assert_eq "등록 에이전트" "claude codex opencode kimi" "${CMUX_AGENTS[*]}"
 t_assert_eq "_agent_known codex/opencode/gemini" "0 0 1" \
   "$(_agent_known codex; print -n "$? "; _agent_known opencode; print -n "$? "; _agent_known gemini; print -n $?)"
 _r() { _agent_call "$1" "$2"; print -r -- "$REPLY"; }
-t_assert_eq "label" "Claude Code|Codex|OpenCode" "$(_r claude label)|$(_r codex label)|$(_r opencode label)"
-t_assert_eq "default_perm (claude=auto, codex=safe, opencode=auto)" "auto|safe|auto" \
-  "$(_r claude default_perm)|$(_r codex default_perm)|$(_r opencode default_perm)"
-t_assert_eq "fastfail 5초" "5|5|5" "$(_r claude fastfail)|$(_r codex fastfail)|$(_r opencode fastfail)"
+t_assert_eq "label" "Claude Code|Codex|OpenCode|Kimi Code" "$(_r claude label)|$(_r codex label)|$(_r opencode label)|$(_r kimi label)"
+t_assert_eq "default_perm (claude=auto, codex=safe, opencode=auto, kimi=safe)" "auto|safe|auto|safe" \
+  "$(_r claude default_perm)|$(_r codex default_perm)|$(_r opencode default_perm)|$(_r kimi default_perm)"
+t_assert_eq "fastfail 5초" "5|5|5|5" "$(_r claude fastfail)|$(_r codex fastfail)|$(_r opencode fastfail)|$(_r kimi fastfail)"
 REPLY=x; _agent_call zzz last_activity /nowhere
 t_assert_eq "미등록 기본 last_activity = 0" 0 "$REPLY"
 

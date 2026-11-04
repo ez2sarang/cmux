@@ -1,0 +1,51 @@
+# grok.zsh.example — 새 에이전트 CLI(예: Grok)를 cmux에 붙이는 견본. 이 파일은 활성화되지 않는다(확장자 .example).
+#
+# 쓰는 법
+#   1) 이 파일을 ~/.config/cmux/agents.d/grok.zsh 로 복사한다 (디렉토리: 환경변수 CMUX_AGENTS_D 로 변경 가능).
+#   2) 아래 "공식 문서로 확인 후 채울 것" 자리를 그 CLI의 공식 문서(설치 경로·플래그)로 채운다 — 기억·추측으로 채우지 않는다.
+#   3) cmux -h 의 '에이전트:' 줄에 grok 이 보이면 등록된 것이다. 'cmux -a grok [경로]' 로 연다.
+#
+# 규칙 (자세히: bin/cmux-agents.zsh 맨 위 주석과 맨 아래 _ag_load_extensions)
+#   · 이름은 [a-z][a-z0-9_]* . 이미 등록된 이름(claude codex opencode kimi 또는 앞선 파일)을 다시 등록하면 경고 후 무시되고,
+#     그 이름의 _ag_<이름>_* 함수도 덮어쓰지 못한다.
+#   · 문법 오류가 있으면 경고 1줄 후 이 파일 전체를 건너뛴다(cmux는 계속 동작).
+#   · 이 파일은 함수 안에서 source 된다 — 상태 변수는 `typeset -g` 로 선언한다.
+#   · 권한 프로파일은 환경변수 CMUX_GROK_PERM=auto|safe 로 사용자가 바꿀 수 있다 (default_perm 이 기본값).
+#     프로젝트별 인자는 ~/.config/cmux/agent-args 의 'grok' 줄이 perm_args 를 통째로 대신한다.
+#
+# 채워야 하는 훅 (전부 선택 — 정의하지 않은 훅은 기본 구현: bin=PATH의 grok, default_perm=auto, 인자 없음, 이력 없음)
+#   label          표시 이름
+#   bin            실행 파일 경로 → REPLY (못 찾으면 비0). _ag_search_bin <이름> <후보 경로...> 도우미: 환경변수 CMUX_GROK_BIN → 후보 → PATH
+#   default_perm   auto|safe 중 기본값 → REPLY. 가드 훅이 없는 CLI는 safe 를 권한다
+#   perm_args      <auto|safe> 에 해당하는 권한 인자 → reply 배열
+#   resume_args    이어하기 인자 → reply 배열
+#   fresh_args     새 대화 인자 → reply 배열
+#   has_history    <dir> 에 이어갈 대화가 있으면 0, REPLY 에 배너용 짧은 설명 (이력 판정을 CLI에 맡기면 항상 0 + "이력이 없으면 새 대화")
+#   last_activity  <dir> 의 마지막 대화 활동 시각(epoch 초, 없으면 0) → REPLY — 핸드오프 마커 유예 판정용
+#   fastfail       이어하기가 이 시간(초) 안에 비0 종료하면 새 대화로 1회 재실행 → REPLY (기본 5)
+#   compose        <resume|fresh> <권한 인자...> → reply 실행 인자 전체 (인자 순서가 특별할 때만)
+
+CMUX_AGENTS+=(grok)
+
+_ag_grok_label() { REPLY="Grok" }
+
+_ag_grok_bin() {
+  # TODO: 공식 문서로 확인 후 채울 것 — 설치 경로 후보 (예: "$HOME/<설치 디렉토리>/bin/grok")
+  _ag_search_bin grok
+}
+
+_ag_grok_default_perm() { REPLY=safe }
+
+_ag_grok_perm_args() {
+  # TODO: 공식 문서로 확인 후 채울 것 — $1 이 auto 일 때와 safe 일 때의 권한 플래그
+  reply=()
+}
+
+_ag_grok_resume_args() {
+  # TODO: 공식 문서로 확인 후 채울 것 — 이전 대화 이어하기 플래그/서브커맨드
+  reply=()
+}
+
+# fresh_args · has_history · last_activity · fastfail : 필요하면 위와 같은 모양으로 정의한다.
+#   has_history() { …; REPLY="설명"; return 0 }   # 0 = 이어갈 대화 있음 (반환 전에 REPLY 설정)
+#   last_activity() { REPLY=0 }                    # epoch 초
