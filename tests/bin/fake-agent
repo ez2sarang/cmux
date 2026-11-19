@@ -1,18 +1,26 @@
 #!/bin/sh
 # fake-agent — 가짜 에이전트 CLI (cmux 테스트 전용, 실제 claude/codex/opencode/gemini 대신 실행)
-# 심볼릭 링크 이름(fake-claude/fake-codex/fake-opencode/fake-gemini)으로 에이전트를 구분한다.
+# 심볼릭 링크 이름(fake-claude/fake-codex/fake-opencode/fake-kimi/fake-gemini)으로 에이전트를 구분한다.
 # FAKE_AGENT_LOG 에 "basename($0)<TAB>$PWD<TAB>인자들(공백 구분)" 한 줄을 남기고 sleep으로 대기한다.
 # FAKE_AGENT_FAIL_ON=<인자>: 그 인자가 있으면 기록 후 곧바로 exit 1 (예: --continue → "No conversation found" 흉내)
 #   FAKE_AGENT_FAIL_SIGNAL=<신호>를 함께 주면 exit 1 대신 그 신호로 스스로 죽는다 (예: KILL → rc 137)
 # fake-opencode의 세션 목록 조회('--pure session list ...')는 에이전트 실행이 아니다 — FAKE_OPENCODE_LIST 파일 내용을
 #   출력하고 끝난다. 기록은 첫 칸을 "fake-opencode-list"로 구분한다.
 #   FAKE_OPENCODE_LIST_SLEEP=<초>: 출력 없이 그 시간 대기 (조회 시간 초과 흉내)
+# fake-kimi의 세션 목록 조회('session list ...')도 마찬가지 — FAKE_KIMI_LIST 파일 내용을 출력하고 끝난다(기록 첫 칸 "fake-kimi-list").
+#   FAKE_KIMI_LIST_SLEEP=<초>: 출력 없이 대기, FAKE_KIMI_LIST_RC=<숫자>: 그 종료코드로 끝남
 log="${FAKE_AGENT_LOG:-/tmp/fake-agent.log}"
 if [ "$(basename "$0")" = fake-opencode ] && [ "$1 $2 $3" = "--pure session list" ]; then
   printf 'fake-opencode-list\t%s\t%s\n' "$PWD" "$*" >> "$log"
   [ -n "$FAKE_OPENCODE_LIST_SLEEP" ] && exec sleep "$FAKE_OPENCODE_LIST_SLEEP"
   [ -n "$FAKE_OPENCODE_LIST" ] && cat "$FAKE_OPENCODE_LIST"
   exit 0
+fi
+if [ "$(basename "$0")" = fake-kimi ] && [ "$1 $2" = "session list" ]; then
+  printf 'fake-kimi-list\t%s\t%s\n' "$PWD" "$*" >> "$log"
+  [ -n "$FAKE_KIMI_LIST_SLEEP" ] && exec sleep "$FAKE_KIMI_LIST_SLEEP"
+  [ -n "$FAKE_KIMI_LIST" ] && cat "$FAKE_KIMI_LIST"
+  exit "${FAKE_KIMI_LIST_RC:-0}"
 fi
 printf '%s\t%s\t%s\n' "$(basename "$0")" "$PWD" "$*" >> "$log"
 if [ -n "$FAKE_AGENT_FAIL_ON" ]; then

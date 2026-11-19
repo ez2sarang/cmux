@@ -24,6 +24,8 @@ unset _t_v
 # 상태 훅 주입(--settings, bin/cmux의 _state_hook_args)은 시험에서 기본으로 끈다 — claude argv를 정확 비교하는 기존 시험이 그대로 통과하게.
 # 상태 배지 시험(unit t07_agent_state · integration t09_state_badge)만 CMUX_STATE_HOOKS=1 로 켠다.
 export CMUX_STATE_HOOKS=0
+# 에이전트 확장 디렉토리(agents.d)도 실제 ~/.config/cmux/agents.d 가 시험에 새지 않게 존재하지 않는 경로로 — agents.d 시험만 직접 지정한다
+export CMUX_AGENTS_D="/nonexistent/cmux-agents.d"
 
 typeset -r T_LIVE_SESSION="claude"   # 라이브 세션 이름 — 조회만, 절대 변경 금지
 T_REPO="${${(%):-%x}:A:h:h:h}"
@@ -112,7 +114,7 @@ t_setup() {
 
   mkdir -p "$T_ROOT"/{bin,cfg,layouts,claude-config,proj,logs,zdotdir}
   local a
-  for a in claude codex opencode gemini; do
+  for a in claude codex opencode kimi gemini; do
     ln -s "$T_REPO/tests/bin/fake-agent" "$T_ROOT/bin/fake-$a"
   done
   # cmux-bar 스텁 — 실제 cmux-bar는 키 입력으로 close-tab/quit을 실행하므로 테스트에서 배제
@@ -145,6 +147,7 @@ t_setup() {
   export CMUX_CLAUDE_BIN="$T_ROOT/bin/fake-claude"
   export CMUX_CODEX_BIN="$T_ROOT/bin/fake-codex"
   export CMUX_OPENCODE_BIN="$T_ROOT/bin/fake-opencode"
+  export CMUX_KIMI_BIN="$T_ROOT/bin/fake-kimi"
   export CMUX_GEMINI_BIN="$T_ROOT/bin/fake-gemini"
   export FAKE_AGENT_LOG="$T_ROOT/fake-agent.log"
   # 실행별 고유값 — 남은 가짜 에이전트(exec sleep)를 pgrep으로 식별

@@ -47,6 +47,8 @@ export FAKE_AGENT_LOG="$U_TMP/fake.log" FAKE_AGENT_SLEEP=0
 export CMUX_SOURCE_ONLY=1
 
 CMUX_SOURCE_ONLY=1 source "$CMUX_UNDER_TEST" || { print -u2 "source 실패: $CMUX_UNDER_TEST"; exit 1; }
+# A2는 기존 macOS/일반 Linux 탐색 규칙을 검증한다. WSL 분기는 t08_windows_codex에서 검증.
+_ag_is_wsl() { return 1; }
 
 # ── 공용 도우미 ───────────────────────────────────────
 # _set_mtime <파일> <epoch 초>
@@ -74,14 +76,14 @@ PERM="--dangerously-skip-permissions"
 
 # ── A1 ────────────────────────────────────────────────
 t_scenario A1 "등록·훅 기본값"
-t_assert_eq "등록 에이전트" "claude codex opencode" "${CMUX_AGENTS[*]}"
+t_assert_eq "등록 에이전트" "claude codex opencode kimi" "${CMUX_AGENTS[*]}"
 t_assert_eq "_agent_known codex/opencode/gemini" "0 0 1" \
   "$(_agent_known codex; print -n "$? "; _agent_known opencode; print -n "$? "; _agent_known gemini; print -n $?)"
 _r() { _agent_call "$1" "$2"; print -r -- "$REPLY"; }
-t_assert_eq "label" "Claude Code|Codex|OpenCode" "$(_r claude label)|$(_r codex label)|$(_r opencode label)"
-t_assert_eq "default_perm (claude=auto, codex=safe, opencode=auto)" "auto|safe|auto" \
-  "$(_r claude default_perm)|$(_r codex default_perm)|$(_r opencode default_perm)"
-t_assert_eq "fastfail 5초" "5|5|5" "$(_r claude fastfail)|$(_r codex fastfail)|$(_r opencode fastfail)"
+t_assert_eq "label" "Claude Code|Codex|OpenCode|Kimi Code" "$(_r claude label)|$(_r codex label)|$(_r opencode label)|$(_r kimi label)"
+t_assert_eq "default_perm (claude=auto, codex=safe, opencode=auto, kimi=safe)" "auto|safe|auto|safe" \
+  "$(_r claude default_perm)|$(_r codex default_perm)|$(_r opencode default_perm)|$(_r kimi default_perm)"
+t_assert_eq "fastfail 5초" "5|5|5|5" "$(_r claude fastfail)|$(_r codex fastfail)|$(_r opencode fastfail)|$(_r kimi fastfail)"
 REPLY=x; _agent_call zzz last_activity /nowhere
 t_assert_eq "미등록 기본 last_activity = 0" 0 "$REPLY"
 

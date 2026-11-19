@@ -49,9 +49,14 @@ command -v python3 >/dev/null 2>&1 || missing+=("python3")
 if [[ ${#missing[@]} -gt 0 ]]; then
   _err "필수 도구가 없습니다: ${missing[*]}"
   echo ""
-  echo "설치 방법 (macOS):"
-  echo "  brew install zellij"
-  echo "  python3 는 macOS 기본 포함"
+  if [[ "$OSTYPE" == darwin* ]]; then
+    echo "설치 방법 (macOS / Ghostty):"
+    echo "  brew install zellij python"
+  else
+    echo "Windows / Noctty에서는 WSL(Ubuntu) 안에서 설치하세요."
+    echo "  WSL/Linux에 zsh, zellij, python3가 필요합니다."
+    echo "  Windows Codex는 Windows Node.js + npm 설치본을 사용합니다."
+  fi
   exit 1
 fi
 
@@ -93,11 +98,13 @@ _install_bin() {
 
 _info "바이너리 설치 중..."
 # cmux가 쓰는 파일을 먼저, cmux를 마지막에 설치한다
+_install_bin "${SCRIPT_DIR}/bin/cmux-codex-windows" "${BIN_DIR}/cmux-codex-windows"
 _install_bin "${SCRIPT_DIR}/bin/cmux-agents.zsh" "${BIN_DIR}/cmux-agents.zsh"
 _install_bin "${SCRIPT_DIR}/bin/cmux-picker"     "${BIN_DIR}/cmux-picker"
 _install_bin "${SCRIPT_DIR}/bin/cmux-bar"        "${BIN_DIR}/cmux-bar"
 _install_bin "${SCRIPT_DIR}/bin/cmux-agent-state" "${BIN_DIR}/cmux-agent-state"
 _install_bin "${SCRIPT_DIR}/bin/cmux"            "${BIN_DIR}/cmux"
+_install_bin "${SCRIPT_DIR}/bin/cmux-desktop"    "${BIN_DIR}/cmux-desktop"
 
 # ── zellij 설정 설치 ──────────────────────────────────
 _info "zellij 레이아웃 설치 중..."

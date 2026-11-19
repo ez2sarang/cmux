@@ -29,8 +29,8 @@ unset CMUX_AGENT CMUX_DEFAULT_AGENT
 # PATH 맨 앞의 가짜 zellij — 호출만 기록하고 exit 1 (세션 없음 → 콜드 경로, 클라이언트 실행은 즉시 실패)
 print -r -- $'#!/bin/sh\necho "$*" >> "'"$U_TMP"$'/zellij-calls"\nexit 1' > "$U_TMP/bin/zellij"
 chmod +x "$U_TMP/bin/zellij"
-for a in claude codex opencode; do ln -s "$T_REPO/tests/bin/fake-agent" "$U_TMP/bin/fake-$a"; done
-export CMUX_CLAUDE_BIN="$U_TMP/bin/fake-claude" CMUX_CODEX_BIN="$U_TMP/bin/fake-codex" CMUX_OPENCODE_BIN="$U_TMP/bin/fake-opencode"
+for a in claude codex opencode kimi; do ln -s "$T_REPO/tests/bin/fake-agent" "$U_TMP/bin/fake-$a"; done
+export CMUX_CLAUDE_BIN="$U_TMP/bin/fake-claude" CMUX_CODEX_BIN="$U_TMP/bin/fake-codex" CMUX_OPENCODE_BIN="$U_TMP/bin/fake-opencode" CMUX_KIMI_BIN="$U_TMP/bin/fake-kimi"
 export FAKE_AGENT_LOG="$U_TMP/fake-agent.log" FAKE_AGENT_SLEEP=0
 print -r -- $'#!/bin/sh\nprintf "[bar]"' > "$U_TMP/bin/bar-stub"
 chmod +x "$U_TMP/bin/bar-stub"
@@ -40,6 +40,9 @@ export PATH="$U_TMP/bin:$PATH"
 CMUX_SOURCE_ONLY=1 source "$CMUX_UNDER_TEST" || { print -u2 "source 실패: $CMUX_UNDER_TEST"; exit 1; }
 DEV_ROOT="$U_TMP/dev"
 EXTRAS_FILE="$U_TMP/cfg/extras"
+
+_inode() { python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "$1"; }
+_checksum() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"; }
 
 T=$'\t'
 A="$DEV_ROOT/alpha" B="$DEV_ROOT/beta" G="$DEV_ROOT/gamma" MP="$DEV_ROOT/my·proj"
@@ -207,20 +210,20 @@ out="$(CMUX_CONFIG_FILE="$CFG2" _cm default codex; print -r -- "rc=$?")"
 t_assert_contains "파일·디렉토리 없음 → 생성, 확인 메시지" "$out" "기본 에이전트 = codex  (설정: $CFG2)"
 t_assert_eq "새 설정 파일 내용" "CMUX_DEFAULT_AGENT=codex" "$(cat "$CFG2" 2>/dev/null)"
 print -r -l -- "# cmux 설정" "CMUX_CODEX_PERM=auto" "  export CMUX_DEFAULT_AGENT=claude" "FOO=1" "CMUX_DEFAULT_AGENT=opencode" "# CMUX_DEFAULT_AGENT=x" > "$CMUX_CONFIG_FILE"
-ino0="$(stat -f %i "$CMUX_CONFIG_FILE")"
+ino0="$(_inode "$CMUX_CONFIG_FILE")"
 _cm default opencode >/dev/null
 t_assert_eq "기존 줄 교체(첫 위치), 중복 줄 제거, 다른 줄·주석 보존" \
   "$(_lines "# cmux 설정" "CMUX_CODEX_PERM=auto" "CMUX_DEFAULT_AGENT=opencode" "FOO=1" "# CMUX_DEFAULT_AGENT=x")" "$(cat "$CMUX_CONFIG_FILE")"
 t_assert_true "원자적 교체 (tmp → mv: inode 바뀜, tmp 잔여 없음)" \
-  '[[ "$(stat -f %i "$CMUX_CONFIG_FILE")" != "$ino0" && -z "$(print -l -- "$CMUX_CONFIG_FILE".tmp.*(N))" ]]'
+  '[[ "$(_inode "$CMUX_CONFIG_FILE")" != "$ino0" && -z "$(print -l -- "$CMUX_CONFIG_FILE".tmp.*(N))" ]]'
 print -r -l -- "FOO=1" > "$CMUX_CONFIG_FILE"
 _cm default codex >/dev/null
 t_assert_eq "줄이 없으면 끝에 추가" "$(_lines "FOO=1" "CMUX_DEFAULT_AGENT=codex")" "$(cat "$CMUX_CONFIG_FILE")"
-sum0="$(md5 -q "$CMUX_CONFIG_FILE")"
+sum0="$(_checksum "$CMUX_CONFIG_FILE")"
 out="$(_cm default nope; print -r -- "rc=$?")"
-t_assert_contains "미등록 에이전트 → 오류 + 사용 가능 목록" "$out" "알 수 없는 에이전트: 'nope' (사용 가능: claude codex opencode)"
+t_assert_contains "미등록 에이전트 → 오류 + 사용 가능 목록" "$out" "알 수 없는 에이전트: 'nope' (사용 가능: claude codex opencode kimi)"
 t_assert_contains "미등록 에이전트 → exit 1" "$out" "rc=1"
-t_assert_eq "미등록 에이전트 → 파일 그대로" "$sum0" "$(md5 -q "$CMUX_CONFIG_FILE")"
+t_assert_eq "미등록 에이전트 → 파일 그대로" "$sum0" "$(_checksum "$CMUX_CONFIG_FILE")"
 out="$(CMUX_AGENT=claude _cm default opencode)"
 t_assert_contains "env CMUX_AGENT가 다르면 우선 안내" "$out" "지금은 환경변수 CMUX_AGENT=claude 가 우선합니다"
 mkdir -p "$U_TMP/real"; print -r -- "BAR=2" > "$U_TMP/real/config"; ln -s "$U_TMP/real/config" "$U_TMP/cfg/linked"
@@ -256,11 +259,11 @@ if git -C "$T_REPO" show "$OLD_REV:bin/cmux" > "$U_TMP/old/cmux" 2>/dev/null \
   ( CMUX_LAYOUTS_DIR="$U_TMP/oldlayouts" CMUX_SOURCE_ONLY=1 source "$U_TMP/old/cmux"
     CMUX_SELF="$CMUX_UNDER_TEST" LAYOUT_FOCUS_DIR="$B" _make_layout "$A" "$B" "$MP" )
   LAYOUT_FOCUS_SPEC="$B" _make_layout "$A" "$B${T}claude" "$MP"
-  # 상단 바 구조가 일부러 바뀌었다(zellij:tab-bar 플러그인 제거 + cmux-bar pane size 2→3, 탭 줄 토글 설계) —
+  # 상단 바 구조가 일부러 바뀌었다(zellij:tab-bar 플러그인 제거 + cmux-bar pane size 2→4, 탭 줄 토글 설계) —
   # 이전 구현 출력에 같은 변환만 적용하면 나머지(탭·포커스·본문·상태바)는 바이트 동일해야 한다.
-  perl -0pe 's/        pane size=1 borderless=true \{\n            plugin location="zellij:tab-bar"\n        \}\n//; s/pane size=2( borderless=true \{\n            command)/pane size=3$1/' \
+  perl -0pe 's/        pane size=1 borderless=true \{\n            plugin location="zellij:tab-bar"\n        \}\n//; s/pane size=2( borderless=true \{\n            command)/pane size=4$1/' \
     "$U_TMP/oldlayouts/cmux-session.kdl" > "$U_TMP/oldlayouts/cmux-session.xform.kdl"
-  t_assert_true "claude 전용 세션 레이아웃 = 이전 구현($OLD_REV) 출력에서 바 구조(tab-bar 제거·바 size 3)만 바꾼 것과 바이트 동일 (포커스 포함)" \
+  t_assert_true "claude 전용 세션 레이아웃 = 이전 구현($OLD_REV) 출력에서 바 구조(tab-bar 제거·바 size 4)만 바꾼 것과 바이트 동일 (포커스 포함)" \
     'cmp -s "$U_TMP/oldlayouts/cmux-session.xform.kdl" "$SESSION_LAYOUT_FILE" && ! cmp -s "$U_TMP/oldlayouts/cmux-session.kdl" "$SESSION_LAYOUT_FILE"'
 else
   t_skip "git show $OLD_REV 실패 — 이전 구현 비교 생략"
@@ -281,16 +284,16 @@ t_assert_eq "new-tab 생성기(claude) = 렌더된 claude-tab.kdl (주석·빈 �
 t_assert_eq "new-tab 생성기(codex) = claude 것에서 pane 이름·launch 인자만 다름" \
   "$(sed -e 's/name="claude"/name="codex"/' -e 's/args "launch"$/args "launch" "--agent" "codex"/' "$U_TMP/rendered-claude-tab.kdl")" "$(_kdl_tab_layout codex)"
 t_assert_not_contains "cmux-bar 없음 → bar pane 없음" "$(CMUX_BAR_BIN= _kdl_tab_layout codex)" "while true"
-# 상단 바 규칙 (설계: 3행 고정) — cmux-bar 있으면 tab-bar 플러그인 없이 size=3 하나, 없으면 네이티브 tab-bar size=1 폴백
+# 상단 바 규칙 (설계: 4행 고정) — cmux-bar 있으면 tab-bar 플러그인 없이 size=3 하나, 없으면 네이티브 tab-bar size=1 폴백
 t_assert_not_contains "cmux-bar 있음 → new-tab 레이아웃에 zellij:tab-bar 없음" "$(_kdl_tab_layout codex)" "zellij:tab-bar"
-t_assert_eq "cmux-bar 있음 → new-tab 레이아웃 바 pane = size=3" $'pane size=3 borderless=true {\npane size=2 borderless=true {' \
+t_assert_eq "cmux-bar 있음 → new-tab 레이아웃 바 pane = size=4" $'pane size=4 borderless=true {\npane size=2 borderless=true {' \
   "$(_kdl_tab_layout codex | grep -E 'pane size=[0-9] borderless' | sed 's/^ *//')"
 t_assert_eq "cmux-bar 없음 → new-tab 레이아웃 = 네이티브 tab-bar size=1 폴백" $'pane size=1 borderless=true {\nplugin location="zellij:tab-bar"' \
   "$(CMUX_BAR_BIN= _kdl_tab_layout codex | grep -B1 'zellij:tab-bar' | sed 's/^ *//')"
 LAYOUT_FOCUS_SPEC= _make_layout "$A"
 t_assert_not_contains "cmux-bar 있음 → 세션 레이아웃에 zellij:tab-bar 없음" "$(cat "$SESSION_LAYOUT_FILE")" "zellij:tab-bar"
-t_assert_contains "cmux-bar 있음 → 세션 레이아웃 바 pane = size=3 (default_tab_template 첫 pane)" \
-  "$(grep -A1 'default_tab_template' "$SESSION_LAYOUT_FILE" | tail -1)" "pane size=3 borderless=true {"
+t_assert_contains "cmux-bar 있음 → 세션 레이아웃 바 pane = size=4 (default_tab_template 첫 pane)" \
+  "$(grep -A1 'default_tab_template' "$SESSION_LAYOUT_FILE" | tail -1)" "pane size=4 borderless=true {"
 CMUX_BAR_BIN= LAYOUT_FOCUS_SPEC= _make_layout "$A"
 t_assert_contains "cmux-bar 없음 → 세션 레이아웃 = 네이티브 tab-bar size=1 폴백" \
   "$(grep -A2 'default_tab_template' "$SESSION_LAYOUT_FILE" | tail -2 | sed 's/^ *//' | paste -sd'|' -)" 'pane size=1 borderless=true {|plugin location="zellij:tab-bar"'
@@ -300,10 +303,10 @@ t_assert_eq "claude → 설치된 claude-tab, 파일 생성 없음" "claude-tab|
 _tab_layout codex; rc=$?
 t_assert_eq "codex → cmux-tab-codex (rc 0)" "cmux-tab-codex|0" "$REPLY|$rc"
 t_assert_eq "생성 파일 내용 = 생성기 출력" "$(_kdl_tab_layout codex)" "$(cat "$U_TMP/layouts/cmux-tab-codex.kdl" 2>/dev/null)"
-ino0="$(stat -f %i "$U_TMP/layouts/cmux-tab-codex.kdl")"
+ino0="$(_inode "$U_TMP/layouts/cmux-tab-codex.kdl")"
 _tab_layout codex
 t_assert_true "매번 원자적 덮어쓰기 (inode 바뀜, tmp 잔여 없음)" \
-  '[[ "$(stat -f %i "$U_TMP/layouts/cmux-tab-codex.kdl")" != "$ino0" && -z "$(print -l -- "$U_TMP"/layouts/*.tmp.*(N))" ]]'
+  '[[ "$(_inode "$U_TMP/layouts/cmux-tab-codex.kdl")" != "$ino0" && -z "$(print -l -- "$U_TMP"/layouts/*.tmp.*(N))" ]]'
 mkdir -p "$U_TMP/rolayouts"; chmod 555 "$U_TMP/rolayouts"
 out="$(ZELLIJ_LAYOUTS_DIR="$U_TMP/rolayouts" _tab_layout opencode 2>&1; print -r -- "rc=$?")"
 t_assert_contains "쓸 수 없는 레이아웃 디렉토리 → 경고·비0" "$out" "탭 레이아웃을 만들지 못했습니다: $U_TMP/rolayouts/cmux-tab-opencode.kdl"$'\n'"rc=1"
@@ -313,7 +316,7 @@ chmod 755 "$U_TMP/rolayouts"
 t_scenario S7 "cmux -a / --agent / cmux <경로> (콜드 경로, 가짜 zellij)"
 rm -f -- "$TABS_FILE" "$TABS_FILE".bak-*(N) "$CMUX_PROJECT_AGENTS_FILE" "$U_TMP/zellij-calls"
 out="$(_cm -a bogus "$A"; print -r -- "rc=$?")"
-t_assert_contains "미등록 에이전트 → 오류 + 사용 가능 목록" "$out" "알 수 없는 에이전트: 'bogus' (사용 가능: claude codex opencode)"
+t_assert_contains "미등록 에이전트 → 오류 + 사용 가능 목록" "$out" "알 수 없는 에이전트: 'bogus' (사용 가능: claude codex opencode kimi)"
 t_assert_contains "미등록 에이전트 → exit 1" "$out" "rc=1"
 out="$(_cm -a; print -r -- "rc=$?")"
 t_assert_contains "에이전트 생략 → 오류·exit 1" "$out" "사용법: cmux -a <에이전트> [경로]"$'\n'"rc=1"
@@ -383,9 +386,9 @@ CMUX_PICKER_BIN="$U_TMP/bin/stub-picker"
 : > "$U_TMP/picker-out"
 _penv() { ( unset _cmux_default_agent; _pick >/dev/null; cat "$U_TMP/picker-env" ) 2>/dev/null; }
 t_assert_eq "env 3종 + CMUX_ROOT (전부 설치·default claude)" \
-  "AGENTS=claude codex opencode|DEFAULT=claude|PREFS=$CMUX_PROJECT_AGENTS_FILE|ROOT=$DEV_ROOT" "$(_penv)"
-t_assert_eq "미설치 에이전트(opencode) 제외" "AGENTS=claude codex|DEFAULT=claude" "$(CMUX_OPENCODE_BIN=/nonexistent/opencode _penv | cut -d'|' -f1-2)"
-t_assert_eq "default는 미설치여도 포함, 등록 순서 유지" "AGENTS=codex opencode|DEFAULT=codex" \
+  "AGENTS=claude codex opencode kimi|DEFAULT=claude|PREFS=$CMUX_PROJECT_AGENTS_FILE|ROOT=$DEV_ROOT" "$(_penv)"
+t_assert_eq "미설치 에이전트(opencode) 제외" "AGENTS=claude codex kimi|DEFAULT=claude" "$(CMUX_OPENCODE_BIN=/nonexistent/opencode _penv | cut -d'|' -f1-2)"
+t_assert_eq "default는 미설치여도 포함, 등록 순서 유지" "AGENTS=codex opencode kimi|DEFAULT=codex" \
   "$(CMUX_CLAUDE_BIN=/nonexistent/claude CMUX_CODEX_BIN=/nonexistent/codex CMUX_AGENT=codex _penv | cut -d'|' -f1-2)"
 
 # _pick_flow — _open_one/_open_many 기록 스텁
@@ -435,7 +438,7 @@ t_assert_contains "default 항목" "$out" "cmux default [에이전트]"
 t_assert_contains "launch --agent 항목" "$out" "cmux launch [경로] --agent <에이전트>"
 t_assert_contains "기존 launch 줄 유지" "$out" "cmux launch [경로] (내부용) Claude Code 실행 — 대화 기록 있으면 --continue"
 t_assert_contains "설정 파일 안내" "$out" "설정:     $CMUX_CONFIG_FILE"
-t_assert_contains "기본 에이전트 안내" "$out" "에이전트: claude codex opencode  — 기본 claude (기본값; 환경변수 CMUX_AGENT > 설정 > claude)"
+t_assert_contains "기본 에이전트 안내" "$out" "에이전트: claude codex opencode kimi  — 기본 claude (기본값; 환경변수 CMUX_AGENT > 설정 > claude)"
 t_assert_not_contains "sync/close-tab은 P2-C 몫 — 아직 없음" "$out" "close-tab"
 
 t_summary

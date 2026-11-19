@@ -1,0 +1,11 @@
+#!/usr/bin/env zsh
+# Terminal entrypoint: Noctty -> WSL -> cmux, then an interactive shell on detach.
+export PATH="$HOME/.local/bin:$PATH"
+export LANG="${LANG:-C.UTF-8}"
+export SHELL="$(command -v zsh)"
+
+CMUX_CONFIG_FILE="${CMUX_CONFIG_FILE:-$HOME/.config/cmux/config}"
+[[ -f "$CMUX_CONFIG_FILE" && -r "$CMUX_CONFIG_FILE" ]] && { source "$CMUX_CONFIG_FILE" } 2>/dev/null
+cd "${CMUX_ROOT:-$HOME/Documents/dev/ai}" || exit 1
+cmux "$@"
+exec "$SHELL" -i

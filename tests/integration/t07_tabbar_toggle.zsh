@@ -15,6 +15,7 @@ t_live_snapshot
 t_setup
 
 export CMUX_TABBAR_STATE_FILE="$T_ROOT/cfg/tabbar-rows"
+print -r -- 1 > "$CMUX_TABBAR_STATE_FILE"  # 접힘 시나리오를 명시적으로 시작(새 기본값은 펼침)
 export CMUX_BAR_CACHE_DIR="$T_ROOT/barcache"
 # 실제 cmux-bar로 레이아웃을 다시 렌더링 (install.sh와 같은 sed 규칙·순서). harness 기본은 스텁이다.
 export CMUX_BAR_BIN="$T_REPO/bin/cmux-bar"

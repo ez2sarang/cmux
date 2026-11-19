@@ -1,0 +1,10 @@
+# Example only: verify the CLI and its flags before enabling an adapter.
+# Copy to ~/.config/cmux/agents.d/grok.zsh after replacing the placeholders.
+# No Grok CLI command or permission flags are assumed here.
+
+# CMUX_AGENTS+=(grok)
+# _ag_grok_label() { REPLY="Grok" }
+# _ag_grok_bin() { _ag_search_bin grok /absolute/path/to/verified-cli }
+# _ag_grok_perm_args() { reply=() }   # Set only flags verified for your CLI.
+# _ag_grok_resume_args() { reply=() }
+# _ag_grok_fresh_args() { reply=() }

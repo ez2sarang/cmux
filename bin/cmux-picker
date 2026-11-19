@@ -91,6 +91,8 @@ def compute_effective_agent(path, explicit, prefs, base):
     """
     if path in explicit:
         return explicit[path]
+    if not prefs:
+        return base
     return prefs.get(path) or prefs.get(os.path.realpath(path)) or base
 
 
@@ -126,6 +128,7 @@ class AgentChoice:
         self.base = default if default in agents else agents[0]  # 선택 기본 — Tab으로 순환
         self.prefs = prefs
         self.explicit = {}  # a로 명시 변경한 항목: {경로: 에이전트}
+        self._remembered = {}  # 경로 조회는 picker 한 번 동안 항목당 최대 한 번 (기억 없음도 캐시)
 
     @classmethod
     def from_env(cls, env):
@@ -139,7 +142,11 @@ class AgentChoice:
         return len(self.agents) > 1
 
     def effective(self, path):
-        return compute_effective_agent(path, self.explicit, self.prefs, self.base)
+        if path in self.explicit:
+            return self.explicit[path]
+        if path not in self._remembered:
+            self._remembered[path] = compute_effective_agent(path, {}, self.prefs, None)
+        return self._remembered[path] or self.base
 
     def badge(self, path):
         return agent_badge(self.effective(path), self.base)
