@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
-# t07_tabbar_toggle — 직접 그리는 탭 줄(bin/cmux-bar)의 1줄↔2줄 토글 (격리 zellij 세션, 실제 cmux-bar)
-#   G 레이아웃 geometry — 바 pane 높이 3(내용 2)·tab-bar 플러그인 없음
+# t07_tabbar_toggle — 직접 그리는 탭 줄(bin/cmux-bar)의 1줄↔3줄 토글 (격리 zellij 세션, 실제 cmux-bar)
+#   G 레이아웃 geometry — 바 pane 높이 4(내용 3)·tab-bar 플러그인 없음
 #   C 접힘: 탭 줄 1 + 툴바 1 (탭 16개가 한 줄에 안 들어간다) · 활성 탭 SGR 색
 #   T 토글(바 pane에 t 키) → 펼침: 탭 2줄(전부 보임)·아이콘 → 다시 접힘 · 상태 파일 값
 #   X 상태 공유 — 다른 탭의 바도 같은 상태 파일로 그려지고, 활성 탭 표시가 따라온다 · 리더 1개(락·캐시)
@@ -18,6 +18,8 @@ export CMUX_TABBAR_STATE_FILE="$T_ROOT/cfg/tabbar-rows"
 export CMUX_BAR_CACHE_DIR="$T_ROOT/barcache"
 # 실제 cmux-bar로 레이아웃을 다시 렌더링 (install.sh와 같은 sed 규칙·순서). harness 기본은 스텁이다.
 export CMUX_BAR_BIN="$T_REPO/bin/cmux-bar"
+mkdir -p "${CMUX_TABBAR_STATE_FILE:h}"
+print -r -- 1 > "$CMUX_TABBAR_STATE_FILE"
 for tmpl in "$T_REPO"/zellij/layouts/*.kdl.tmpl; do
   sed -e "s|CMUX_BAR_BIN|$CMUX_BAR_BIN|g" -e "s|CMUX_BIN|$CMUX_UNDER_TEST|g" "$tmpl" > "$T_ROOT/layouts/${${tmpl:t}%.tmpl}"
 done
@@ -63,7 +65,7 @@ _state() { cat "$CMUX_TABBAR_STATE_FILE" 2>/dev/null; }
 
 # ── 세션 시작 ──────────────────────────────────────────
 t_cmux_bg 180
-t_scenario G "레이아웃 geometry — 바 pane 3행(내용 2행), tab-bar 플러그인 없음"
+t_scenario G "레이아웃 geometry — 바 pane 4행(내용 3행), tab-bar 플러그인 없음"
 t_assert_true "세션 준비" 't_session_ready' 30
 t_assert_true "탭 16개" '(( $(t_tab_count) == 16 ))' 30
 T1="${NAMES[1]}"
@@ -77,12 +79,12 @@ tabbar = [p for p in panes if p.get("is_plugin") and "tab-bar" in (p.get("title"
 status = [p for p in panes if p.get("is_plugin") and "status-bar" in (p.get("title") or "")]
 print("bars=%d rows=%s content=%s tabbar_plugins=%d status_plugins=%d" % (
     len(bars), sorted(set(p["pane_rows"] for p in bars)), sorted(set(p["pane_content_rows"] for p in bars)), len(tabbar), len(status)))')"
-t_assert_eq "바 pane 16개 모두 pane_rows=3·pane_content_rows=2, tab-bar 플러그인 0, status-bar 16" \
-  "bars=16 rows=[3] content=[2] tabbar_plugins=0 status_plugins=16" "$geom"
+t_assert_eq "바 pane 16개 모두 pane_rows=4·pane_content_rows=3, tab-bar 플러그인 0, status-bar 16" \
+  "bars=16 rows=[4] content=[3] tabbar_plugins=0 status_plugins=16" "$geom"
 t_assert_not_contains "렌더한 claude-tab 레이아웃에 zellij:tab-bar 없음" "$(cat "$T_ROOT/layouts/claude-tab.kdl")" "zellij:tab-bar"
 
 t_scenario C "접힘(기본): 0행 = 탭 1줄 + ▾, 1행 = 툴바"
-t_assert_eq "상태 파일 없음 = 접힘" "" "$(_state)"
+t_assert_eq "초기 상태 파일 = 접힘" "1" "$(_state)"
 # 시작 2초 동안은 …만 (list-tabs 지연, #5632) — 그 뒤 탭이 그려진다
 t_assert_true "탭 줄이 그려짐 (첫 탭 라벨)" '[[ "$(_row "$BAR1" 1)" == *"p01-longproje…"* ]]' 25
 print -r -- "  [접힘 dump-screen — 탭 16개, 활성 = 첫 탭]"; _show "$BAR1"

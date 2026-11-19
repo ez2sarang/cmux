@@ -432,13 +432,13 @@ _kdl_tab() {
   print -r -- "    }"
 }
 
-# _bar_pane <들여쓰기> — 상단 바 pane KDL. cmux-bar가 있으면 직접 그리는 탭 줄+툴바(내용 2행 = size=3, 탭 줄 1↔2줄 토글;
+# _bar_pane <들여쓰기> — 상단 바 pane KDL. cmux-bar가 있으면 직접 그리는 탭 줄+툴바(내용 3행 = size=4, 탭 줄 1↔3줄 토글;
 # zellij 0.45.1은 터미널 pane의 마지막 한 행을 쓸 수 없고 1행 pane은 렌더링하지 않는다. 상단 총 3행),
 # 없으면 네이티브 zellij:tab-bar 플러그인(size=1)으로 폴백한다. claude-*.kdl.tmpl과 같은 규칙.
 _bar_pane() {
   local ind="$1"
   if [[ -n "$CMUX_BAR_BIN" && -x "$CMUX_BAR_BIN" ]]; then
-    print -r -- "${ind}pane size=3 borderless=true {
+    print -r -- "${ind}pane size=4 borderless=true {
 ${ind}    command \"/bin/zsh\"
 ${ind}    args \"-c\" \"while true; do ${CMUX_BAR_BIN}; sleep 1; done\"
 ${ind}}"

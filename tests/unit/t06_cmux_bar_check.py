@@ -341,6 +341,17 @@ for rows in (1, 2):
         check("펼침: 아이콘 눌림 영역은 1행 오른쪽 11칸 안 (각 3칸)", all(h[0] == 1 and h[1] >= 177 and h[2] - h[1] == 2 for h in acts.values()), repr(acts))
     eq("%s: 마지막 호출은 refresh" % tag, ("refresh",), scr.calls[-1])
 
+# 세 번째 줄의 탭 배치와 클릭도 확인한다.
+scr = FakeScr(3, 80)
+hits = []
+bar.draw_strip(scr, 3, tabs, False, hits)
+third_row = [hit for hit in hits if hit[0] == 2 and hit[3][0] == "tab"]
+check("펼침 3줄: 세 번째 줄에 탭과 클릭 영역이 있다", bool(third_row) and "proj-alpha" in scr.line(2), repr(scr.line(2)))
+if third_row:
+    hit = third_row[0]
+    eq("세 번째 줄 탭 클릭 → 해당 탭 id", hit[3], bar.classify_mouse(bar.BTN_CLICK, hit[1], 2, hits))
+eq("3줄 폭: 토글·아이콘 제외, 마지막 줄은 전체 폭", [77, 69, 80], bar.strip_caps(80, 3))
+
 # 한글 이름이 깨지지 않는다 (2칸 글자 정렬)
 kt = mk_tabs(["한글프로젝트", "alpha", "베타"], active=0)
 scr = FakeScr(2, 60)
@@ -414,7 +425,7 @@ check("레거시: 탭 줄·토글 글자 없음 (툴바만)", "▾" not in scr.l
 # ── S: 토글 상태 파일 ──────────────────────────────────────────────────────
 scenario("S", "토글 상태 파일 읽기/쓰기")
 sf = os.path.join(TMP, "state", "tabbar-rows")
-eq("파일 없음 → 1", 1, bar.read_rows(sf))
+eq("파일 없음 → 펼침", 2, bar.read_rows(sf))
 os.makedirs(os.path.dirname(sf))
 for content, want in (("1", 1), ("2", 2), ("2\n", 2), (" 2 \n", 2), ("", 1), ("abc", 1), ("3", 1), ("22", 1), ("0", 1)):
     with open(sf, "w") as f:
@@ -433,7 +444,7 @@ eq("toggle 1→2", 2, bar.toggle_rows(sf))
 eq("toggle 2→1", 1, bar.toggle_rows(sf))
 os.unlink(sf)
 nested = os.path.join(TMP, "new", "dir", "rows")
-eq("상위 디렉터리가 없어도 토글이 만든다", 2, bar.toggle_rows(nested))
+eq("상위 디렉터리가 없어도 토글이 만든다", 1, bar.toggle_rows(nested))
 eq("쓸 수 없는 경로: write_rows False·예외 없음", False, bar.write_rows("/dev/null/x/rows", 2))
 eq("쓸 수 없는 경로: toggle은 실제 상태(1)를 돌려준다", 1, bar.toggle_rows("/dev/null/x/rows"))
 os.environ["CMUX_TABBAR_STATE_FILE"] = "/x/y"
@@ -450,8 +461,8 @@ eq("cache_paths: 세션명 정리(/ → _)", ("/c/tabs-a_b.json", "/c/tabs-a_b.l
 eq("cache_paths: 세션명 없음", "/c/tabs-nosession.json", bar.cache_paths("/c", "")[0])
 # run_hit 토글 (zellij 호출 없음)
 sf2 = os.path.join(TMP, "state2", "rows")
-eq("run_hit(toggle) → 2", 2, bar.run_hit(("toggle", None), None, sf2))
-eq("run_hit(toggle) 한 번 더 → 1", 1, bar.run_hit(("toggle", None), None, sf2))
+eq("run_hit(toggle) → 1", 1, bar.run_hit(("toggle", None), None, sf2))
+eq("run_hit(toggle) 한 번 더 → 2", 2, bar.run_hit(("toggle", None), None, sf2))
 
 # ── E: 리더 선출 · 탭 목록 공유 ────────────────────────────────────────────
 scenario("E", "리더 선출(mkdir 락·pid·생존 확인) · 캐시 공유 · 실패 시 유지 · 2초 지연")

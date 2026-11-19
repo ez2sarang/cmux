@@ -104,16 +104,16 @@ cmux bridge [--check|--apply] [경로]   # AGENTS.md ↔ CLAUDE.md 지침 파일
 | `Enter` | 열기 |
 | `Esc` / `q` | 취소 |
 
-### 상단 탭 줄 (1줄 ↔ 2줄 토글)
+### 상단 탭 줄 (1줄 ↔ 3줄 토글)
 
-상단 3행은 `cmux-bar`가 직접 그립니다(zellij 기본 `tab-bar` 플러그인은 1줄 전용이라 쓰지 않음). 높이는 항상 3행이고, 안에서 모양만 바뀝니다.
+상단 바는 `cmux-bar`가 직접 그립니다. 새 레이아웃에서 바 pane 높이는 4행(내용 3행)이며, 기존 높이의 탭에서는 가능한 만큼 표시합니다.
 
-| 상태 | 0행 | 1행 |
-|------|-----|-----|
-| 접힘(기본) | 탭 1줄 + 오른쪽 끝 `▾` | 툴바(`cmux │ ◉ Picker │ × Close │ ⏻ Quit │ … 세션명`) |
-| 펼침 | 탭 줄 + 오른쪽 끝 `▴` | 탭 줄 이어서 + 오른쪽 끝 축약 아이콘 `◉ │ × │ ⏻` |
+| 상태 | 0행 | 1행 | 2행 |
+|------|-----|-----|-----|
+| 접힘 | 탭 1줄 + 오른쪽 끝 `▾` | 툴바(`cmux │ ◉ Picker │ × Close │ ⏻ Quit │ … 세션명`) | 빈 줄 |
+| 펼침(기본) | 탭 줄 + 오른쪽 끝 `▴` | 탭 줄 이어서 + 축약 아이콘 `◉ │ × │ ⏻` | 탭 줄 이어서 |
 
-- 토글: `▾`/`▴` 클릭 또는 바 pane에서 `t` 키. 상태는 `~/.config/cmux/tabbar-rows`(`1` 또는 `2`, 환경변수 `CMUX_TABBAR_STATE_FILE`)에 저장돼 **모든 탭의 바가 0.5초 안에 함께 바뀝니다**(재시작 불필요).
+- 토글: `▾`/`▴` 클릭 또는 바 pane에서 `t` 키. 상태는 `~/.config/cmux/tabbar-rows`(`1`은 접힘, `2`는 펼침; 환경변수 `CMUX_TABBAR_STATE_FILE`)에 저장돼 모든 탭의 바에 반영됩니다. 이미 저장된 접힘 상태는 유지됩니다. 코드와 pane 높이 변경은 실행 중인 세션에 자동 적용되지 않습니다.
 - 탭 이름 클릭 = 그 탭으로 이동, 마우스 휠 위 = 이전 탭. **휠 아래(다음 탭)는 이 머신의 `python3`(`/usr/bin/python3` → Xcode 의 Python 3.9.6, ncurses 6.0 마우스 버전 1 빌드)에 `BUTTON5_PRESSED`가 없어 동작하지 않습니다**(`tests/integration/t08_tabbar_real_click.zsh`에서 휠 위는 이전 탭으로 이동, 휠 아래는 활성 탭 그대로임을 실측; 탭 이름 클릭이나 휠 위로 이동). 이름은 14칸에서 `…`로 자르고(한글 2칸 계산), 벨 알림 탭은 `*`. 다 안 들어가면 활성 탭이 보이는 창만 그리고 가장자리에 숨은 개수(`‹3` `4›`)를 표시합니다.
 - **바 pane의 키는 `p`(피커)와 `t`(토글)뿐입니다. `x`(탭 닫기)·`q`(세션 종료) 키는 일부러 없앴습니다** — Close/Quit은 `× Close`·`⏻ Quit` 버튼 클릭으로만 합니다. 클릭한 바는 자기 탭의 본문(에이전트) pane으로 포커스를 돌려놓습니다(탭 전환 전에 수행; Picker 클릭은 새 floating pane이 포커스를 가져가므로 제외). 포커스를 바에 남겨 두면 나중에 그 탭에서 친 키가 바로 들어가기 때문입니다. (이동은 `focus-next-pane` 반복 — zellij 0.45.1의 `focus-pane-id`는 `mouse_click_through true`에서 클릭이 준 키보드 포커스를 옮기지 못함을 실측. 포커스 확인은 작은 `zellij action list-clients` 응답으로 하고, 바 프로세스가 목표 pane과 이동 횟수를 기억해 두 번째 클릭부터는 큰 `list-panes` 조회 없이 이동합니다. 이동 뒤 확인이 틀리면 기억을 버리고 `list-panes`로 교정하고, 확인 자체를 판단할 수 없으면(`list-clients` 실패·형식 이상) 기억은 유지한 채 `list-panes` 기반의 기존 경로로 처리합니다. 단일 클라이언트 접속을 전제로 합니다 — 여러 클라이언트가 붙어 있으면 "아무 클라이언트에서든 포커스"로 판단합니다.)
 - 첫 클릭부터 동작하려면 zellij `mouse_click_through true`가 필요합니다(레포 `zellij/config.kdl`에 포함; 서버 시작 때만 읽힘 → 이미 떠 있는 세션은 `cmux -k` 후부터, 사용자 `~/.config/zellij/config.kdl`에는 직접 병합). 이 설정이 없으면 포커스 없는 pane의 첫 클릭은 포커스 이동에만 쓰이고 탭 이동은 두 번 클릭해야 합니다.
@@ -200,7 +200,7 @@ export CMUX_CLAUDE_BIN="/custom/path/to/claude"
 cmux/
 ├── bin/
 │   ├── cmux             # 메인 스크립트 (zsh)
-│   ├── cmux-bar         # 상단 탭 줄 + 툴바, 1↔2줄 토글 (Python curses)
+│   ├── cmux-bar         # 상단 탭 줄 + 툴바, 1↔3줄 토글 (Python curses)
 │   ├── cmux-agent-state # 에이전트 상태 훅·롤업 (zsh) — 탭 배지, cmux status/jump
 │   └── cmux-picker      # 커서 기반 피커 (Python)
 ├── doc/

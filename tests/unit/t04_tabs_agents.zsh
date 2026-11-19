@@ -256,11 +256,11 @@ if git -C "$T_REPO" show "$OLD_REV:bin/cmux" > "$U_TMP/old/cmux" 2>/dev/null \
   ( CMUX_LAYOUTS_DIR="$U_TMP/oldlayouts" CMUX_SOURCE_ONLY=1 source "$U_TMP/old/cmux"
     CMUX_SELF="$CMUX_UNDER_TEST" LAYOUT_FOCUS_DIR="$B" _make_layout "$A" "$B" "$MP" )
   LAYOUT_FOCUS_SPEC="$B" _make_layout "$A" "$B${T}claude" "$MP"
-  # 상단 바 구조가 일부러 바뀌었다(zellij:tab-bar 플러그인 제거 + cmux-bar pane size 2→3, 탭 줄 토글 설계) —
+  # 상단 바 구조가 일부러 바뀌었다(zellij:tab-bar 플러그인 제거 + cmux-bar pane size 2→4) —
   # 이전 구현 출력에 같은 변환만 적용하면 나머지(탭·포커스·본문·상태바)는 바이트 동일해야 한다.
-  perl -0pe 's/        pane size=1 borderless=true \{\n            plugin location="zellij:tab-bar"\n        \}\n//; s/pane size=2( borderless=true \{\n            command)/pane size=3$1/' \
+  perl -0pe 's/        pane size=1 borderless=true \{\n            plugin location="zellij:tab-bar"\n        \}\n//; s/pane size=2( borderless=true \{\n            command)/pane size=4$1/' \
     "$U_TMP/oldlayouts/cmux-session.kdl" > "$U_TMP/oldlayouts/cmux-session.xform.kdl"
-  t_assert_true "claude 전용 세션 레이아웃 = 이전 구현($OLD_REV) 출력에서 바 구조(tab-bar 제거·바 size 3)만 바꾼 것과 바이트 동일 (포커스 포함)" \
+  t_assert_true "claude 전용 세션 레이아웃 = 이전 구현($OLD_REV) 출력에서 바 구조(tab-bar 제거·바 size 4)만 바꾼 것과 바이트 동일 (포커스 포함)" \
     'cmp -s "$U_TMP/oldlayouts/cmux-session.xform.kdl" "$SESSION_LAYOUT_FILE" && ! cmp -s "$U_TMP/oldlayouts/cmux-session.kdl" "$SESSION_LAYOUT_FILE"'
 else
   t_skip "git show $OLD_REV 실패 — 이전 구현 비교 생략"
@@ -281,16 +281,16 @@ t_assert_eq "new-tab 생성기(claude) = 렌더된 claude-tab.kdl (주석·빈 �
 t_assert_eq "new-tab 생성기(codex) = claude 것에서 pane 이름·launch 인자만 다름" \
   "$(sed -e 's/name="claude"/name="codex"/' -e 's/args "launch"$/args "launch" "--agent" "codex"/' "$U_TMP/rendered-claude-tab.kdl")" "$(_kdl_tab_layout codex)"
 t_assert_not_contains "cmux-bar 없음 → bar pane 없음" "$(CMUX_BAR_BIN= _kdl_tab_layout codex)" "while true"
-# 상단 바 규칙 (설계: 3행 고정) — cmux-bar 있으면 tab-bar 플러그인 없이 size=3 하나, 없으면 네이티브 tab-bar size=1 폴백
+# 상단 바 규칙 — cmux-bar 있으면 tab-bar 플러그인 없이 size=4 하나, 없으면 네이티브 tab-bar size=1 폴백
 t_assert_not_contains "cmux-bar 있음 → new-tab 레이아웃에 zellij:tab-bar 없음" "$(_kdl_tab_layout codex)" "zellij:tab-bar"
-t_assert_eq "cmux-bar 있음 → new-tab 레이아웃 바 pane = size=3" $'pane size=3 borderless=true {\npane size=2 borderless=true {' \
+t_assert_eq "cmux-bar 있음 → new-tab 레이아웃 바 pane = size=4" $'pane size=4 borderless=true {\npane size=2 borderless=true {' \
   "$(_kdl_tab_layout codex | grep -E 'pane size=[0-9] borderless' | sed 's/^ *//')"
 t_assert_eq "cmux-bar 없음 → new-tab 레이아웃 = 네이티브 tab-bar size=1 폴백" $'pane size=1 borderless=true {\nplugin location="zellij:tab-bar"' \
   "$(CMUX_BAR_BIN= _kdl_tab_layout codex | grep -B1 'zellij:tab-bar' | sed 's/^ *//')"
 LAYOUT_FOCUS_SPEC= _make_layout "$A"
 t_assert_not_contains "cmux-bar 있음 → 세션 레이아웃에 zellij:tab-bar 없음" "$(cat "$SESSION_LAYOUT_FILE")" "zellij:tab-bar"
-t_assert_contains "cmux-bar 있음 → 세션 레이아웃 바 pane = size=3 (default_tab_template 첫 pane)" \
-  "$(grep -A1 'default_tab_template' "$SESSION_LAYOUT_FILE" | tail -1)" "pane size=3 borderless=true {"
+t_assert_contains "cmux-bar 있음 → 세션 레이아웃 바 pane = size=4 (default_tab_template 첫 pane)" \
+  "$(grep -A1 'default_tab_template' "$SESSION_LAYOUT_FILE" | tail -1)" "pane size=4 borderless=true {"
 CMUX_BAR_BIN= LAYOUT_FOCUS_SPEC= _make_layout "$A"
 t_assert_contains "cmux-bar 없음 → 세션 레이아웃 = 네이티브 tab-bar size=1 폴백" \
   "$(grep -A2 'default_tab_template' "$SESSION_LAYOUT_FILE" | tail -2 | sed 's/^ *//' | paste -sd'|' -)" 'pane size=1 borderless=true {|plugin location="zellij:tab-bar"'

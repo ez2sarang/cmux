@@ -3,14 +3,14 @@
 cmux-bar — zellij 상단 탭 줄 + 툴바 (직접 그리는 curses 바)
 
 두 모드 (pane 내용 행 수로 자동 선택):
-  스트립 모드 (내용 2행 이상, 새 레이아웃의 size=3 pane — 네이티브 tab-bar 플러그인 없음)
+  스트립 모드 (내용 2행 이상, 새 레이아웃의 size=4 pane — 네이티브 tab-bar 플러그인 없음)
     접힘(1): 0행 = 탭 1줄 + 토글 ▾,  1행 = 툴바 (cmux │ Picker │ Close │ Quit │ 세션명)
-    펼침(2): 0·1행 = 탭 2줄 (0행 오른쪽 끝 토글 ▴, 1행 오른쪽 끝 축약 아이콘 ◉ × ⏻)
+    펼침(2): 탭 최대 3줄 (0행 오른쪽 끝 토글 ▴, 1행 오른쪽 끝 축약 아이콘 ◉ × ⏻)
   레거시 모드 (내용 1행, 옛 레이아웃 — 위에 네이티브 tab-bar가 따로 있다): 툴바 1행만 그린다.
 
 조작:
   탭 이름 클릭   → 그 탭으로 이동        마우스 휠 위/아래 → 이전/다음 탭
-  ▾/▴ 클릭 · t   → 1줄 ↔ 2줄 토글 (상태 파일 공유 → 모든 탭이 즉시 따라간다)
+  ▾/▴ 클릭 · t   → 1줄 ↔ 3줄 토글 (상태 파일 공유)
   p / [◉ Picker] → 프로젝트 피커 (floating pane)
   [× Close]      → 현재 탭 닫기 (클릭 전용 — x 키 없음)
   [⏻ Quit]       → 세션 종료 (클릭 전용 — q 키 없음)
@@ -23,7 +23,7 @@ cmux-bar — zellij 상단 탭 줄 + 툴바 (직접 그리는 curses 바)
   에이전트 상태는 cmux-agent-state 훅이 쓴 상태 파일에서 리더가 읽어 캐시에 `cmux_state`로 싣는다.
 
 공유 상태 (표준 라이브러리만, 네트워크·LLM 없음):
-  토글 상태 파일  ${CMUX_TABBAR_STATE_FILE:-$HOME/.config/cmux/tabbar-rows}  (1 또는 2, 없으면 1)
+  토글 상태 파일  ${CMUX_TABBAR_STATE_FILE:-$HOME/.config/cmux/tabbar-rows}  (1=접힘, 2=펼침, 없으면 펼침)
   탭 목록 캐시    ${CMUX_BAR_CACHE_DIR:-${TMPDIR:-/tmp}/cmux-bar-$UID}/tabs-<세션>.json
                   리더 1개만 1초마다 `zellij action list-tabs --json`을 부르고 나머지는 파일만 읽는다.
   에이전트 상태    ${CMUX_AGENT_STATE_DIR:-$HOME/.config/cmux/agent-state}/<세션>/<pane_id>  (리더만 읽는다)
@@ -192,6 +192,8 @@ def strip_caps(w: int, rows: int) -> list:
     caps = [max(0, w - TOGGLE_W)]
     if rows >= 2:
         caps.append(max(0, w - ICONS_W))
+    if rows >= 3:
+        caps.append(max(0, w))
     return caps
 
 
@@ -280,10 +282,12 @@ def state_path() -> str:
 
 
 def read_rows(path: str) -> int:
-    """상태 파일 → 1 또는 2 (없거나 이상한 내용이면 1)."""
+    """상태 파일 → 1(접힘) 또는 2(펼침). 파일이 없으면 펼침."""
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             return 2 if f.read(16).strip() == "2" else 1
+    except FileNotFoundError:
+        return 2
     except OSError:
         return 1
 
@@ -1004,7 +1008,7 @@ def draw_icons(stdscr, y: int, hits: list) -> None:
 
 
 def draw_strip(stdscr, rows: int, tabs, placeholder: bool, hits: list) -> None:
-    """스트립 모드 (pane 내용 2행 이상): 탭 줄 + 토글, 그리고 접힘이면 툴바 / 펼침이면 2줄째 탭 + 아이콘."""
+    """탭 줄과 토글, 접힘 툴바 또는 펼침 아이콘을 그린다."""
     h, w = stdscr.getmaxyx()
     stdscr.erase()
     hits.clear()
@@ -1134,9 +1138,10 @@ def bar_main(stdscr) -> None:
                     pass
                 tabs = source.tabs
                 placeholder = tabs is None
-                sig = ("strip", h, w, rows, placeholder, tabs)
+                visible_rows = min(h, 3) if rows == 2 else 1
+                sig = ("strip", h, w, visible_rows, placeholder, tabs)
                 if sig != last_sig or now >= next_force:
-                    draw_strip(stdscr, rows, tabs, placeholder, hits)
+                    draw_strip(stdscr, visible_rows, tabs, placeholder, hits)
                     last_sig, next_force = sig, now + 5
 
             k = stdscr.getch()
