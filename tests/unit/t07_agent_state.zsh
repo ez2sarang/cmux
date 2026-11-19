@@ -317,7 +317,8 @@ _tabs_json() { # <활성 위치(1부터, 0이면 없음)> — 탭 5개: alpha be
   print -r -- "[${(j:,:)parts}]"
 }
 export ZJ_TABS="$U_TMP/tabs.json"
-_cmux() { env CMUX_STATE_HOOKS=0 LANG=en_US.UTF-8 zsh "$CMUX_UNDER_TEST" "$@" 2>&1; }
+STATE_TEST_LOCALE="$(locale -a | awk 'tolower($0) ~ /^(en_us|c)\.(utf-8|utf8)$/ { print; exit }')"
+_cmux() { env CMUX_STATE_HOOKS=0 LANG="${STATE_TEST_LOCALE:-en_US.UTF-8}" LC_ALL="${STATE_TEST_LOCALE:-en_US.UTF-8}" zsh "$CMUX_UNDER_TEST" "$@" 2>&1; }
 _tabs_json 2 > "$ZJ_TABS"
 _hook "$SESS" 1 alpha PermissionRequest; _hook "$SESS" 2 gamma UserPromptSubmit; _hook "$SESS" 3 delta Stop; _hook "$SESS" 4 한글탭 PermissionRequest
 export CMUX_AGENT_STATE_BIN="$STATE_BIN"

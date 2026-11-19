@@ -1,0 +1,6 @@
+* text=auto
+/bin/* text eol=lf
+/install.sh text eol=lf
+/tests/** text eol=lf
+/zellij/** text eol=lf
+/doc/agents.d/** text eol=lf

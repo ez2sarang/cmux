@@ -30,6 +30,7 @@ cmux-bar — zellij 상단 탭 줄 + 툴바 (직접 그리는 curses 바)
 """
 
 import curses
+from concurrent.futures import ThreadPoolExecutor
 import json
 import locale
 import os
@@ -68,7 +69,7 @@ ICONS_W = 11
 TOGGLE_W = 3                      # 0행 오른쪽 끝 " ▾ " / " ▴ " (눌림 영역 = 이 3칸)
 TAB_NAME_MAX = 14                 # 탭 이름 최대 칸 수 (넘으면 … 로 자름)
 
-POLL_MS = 400                     # 입력 대기 주기 — 상태 파일 변화는 이 주기 안에 반영된다
+POLL_MS = 100                     # 입력은 즉시 수신, 공유 캐시·상태 파일 변화는 100ms 안에 확인
 FETCH_SECS = 1.0                  # 리더의 list-tabs 주기
 FIRST_CALL_DELAY = 2.0            # 시작 직후 zellij CLI 금지 구간 (zellij 0.45.1 #5632 서버 panic 회피)
 STALE_SECS = 3.0                  # 캐시가 이만큼 낡으면 팔로워가 리더를 인수한다
@@ -730,7 +731,7 @@ class TabSource:
         """캐시 파일이 바뀌었으면 읽는다. 바뀌어서 읽었으면 True."""
         try:
             st = os.stat(self.cache_file)
-            sig = (st.st_mtime_ns, st.st_size)
+            sig = (st.st_ino, st.st_mtime_ns, st.st_size)
             if sig == self._sig:
                 return False
             with open(self.cache_file, encoding="utf-8") as f:
@@ -762,6 +763,9 @@ class TabSource:
         if leader:
             _touch(self.pid_file, now)            # 하트비트 — 조회가 느려도 인수당하지 않게
         raw = self.fetch()
+        return self._accept_refresh(raw, now, leader)
+
+    def _accept_refresh(self, raw, now: float, leader: bool) -> bool:
         if raw is None:
             if leader:
                 self.fail_streak += 1
@@ -773,7 +777,7 @@ class TabSource:
         if write_atomic(self.cache_file, text):
             try:
                 st = os.stat(self.cache_file)
-                self._sig = (st.st_mtime_ns, st.st_size)
+                self._sig = (st.st_ino, st.st_mtime_ns, st.st_size)
             except OSError:
                 self._sig = None
         tabs = normalize_tabs(raw)
@@ -849,7 +853,7 @@ class TabSource:
             return False
         try:
             st = os.stat(self.cache_file)
-            self._sig = (st.st_mtime_ns, st.st_size)
+            self._sig = (st.st_ino, st.st_mtime_ns, st.st_size)
         except OSError:
             self._sig = None
         self.tabs = normalize_tabs(raw)
@@ -860,6 +864,75 @@ class TabSource:
         if self.is_leader and _read_pid(self.pid_file) == self.pid:
             shutil.rmtree(self.lock_dir, ignore_errors=True)
         self.is_leader = False
+
+
+class AsyncTabSource(TabSource):
+    """CLI 조회만 작업 스레드에서 실행한다. UI·캐시·리더 상태는 입력 스레드에서만 바꾼다."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._pending = None
+        self._generation = 0
+        self._refresh_requested = False
+
+    def _cache_inode(self):
+        try:
+            st = os.stat(self.cache_file)
+            return st.st_dev, st.st_ino
+        except OSError:
+            return None
+
+    def _refresh(self, now: float, leader: bool) -> bool:
+        if self._pending is None:
+            if leader:
+                _touch(self.pid_file, now)
+            cache_inode = self._cache_inode()
+            self._pending = (self._executor.submit(self.fetch), self._generation, leader, cache_inode)
+            self._refresh_requested = False
+        return False
+
+    def poll(self, elapsed: float, now: float = None) -> bool:
+        now = time.time() if now is None else now
+        changed = False
+        if self._pending is not None:
+            future, generation, leader, cache_inode = self._pending
+            if future.done():
+                self._pending = None
+                try:
+                    raw = future.result()
+                except Exception:  # 조회 오류도 기존 백오프·마지막 정상 목록 유지 경로로
+                    raw = None
+                owns_lock = not self.usable or _read_pid(self.pid_file) == self.pid
+                # 다른 바의 클릭이 공유 캐시를 바꿨을 때도 이전 조회로 활성 표시를 되돌리지 않는다.
+                # 하트비트의 mtime 갱신은 파일 교체가 아니므로 정상 조회 결과를 버리지 않는다.
+                if generation == self._generation and cache_inode == self._cache_inode() and (not leader or owns_lock):
+                    changed = self._accept_refresh(raw, now, leader)
+                    if not self.usable:
+                        self.next_fetch = max(self.next_fetch, now + 3 * FETCH_SECS)
+        changed = super().poll(elapsed, now) or changed
+        if self._refresh_requested and elapsed >= FIRST_CALL_DELAY:
+            self._refresh(now, self.is_leader)
+        return changed
+
+    def mark_active(self, tab_id) -> bool:
+        changed = super().mark_active(tab_id)
+        if changed:
+            # 전환 전에 시작한 조회가 늦게 도착해 새 활성 탭 표시를 되돌리지 않게 한다.
+            self._generation += 1
+        return changed
+
+    def refresh_now(self) -> bool:
+        self._generation += 1
+        self.next_fetch = 0.0
+        self._refresh_requested = True
+        # 진행 중인 오래된 조회는 poll에서 버리고, 다음 조회도 입력을 막지 않는다.
+        return self._refresh(time.time(), self.is_leader)
+
+    def close(self) -> None:
+        # 작업 스레드는 fetch만 수행하므로 종료 뒤 캐시를 덮어쓰거나 락을 반납하지 않는다.
+        self._executor.shutdown(wait=False)
+        super().close()
 
 
 def _touch(path: str, when: float = None) -> None:
@@ -1131,7 +1204,7 @@ def bar_main(stdscr) -> None:
             else:
                 rows = read_rows(sfile)
                 if source is None:
-                    source = TabSource(SESSION, cache_dir_path())
+                    source = AsyncTabSource(SESSION, cache_dir_path())
                 try:
                     source.poll(elapsed)
                 except Exception:  # 상태 표시줄은 예기치 않은 I/O 오류로 죽지 않는다 — 마지막 탭 목록으로 계속

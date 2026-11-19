@@ -6,6 +6,13 @@
 
 스택: Bash / Shell
 
+## 실행 환경
+
+- macOS: Ghostty → zsh → cmux/zellij → macOS 에이전트 CLI.
+- Windows: **Noctty → WSL(Ubuntu) → zsh → cmux/zellij → Windows 네이티브 Codex**. PowerShell에서 cmux가 직접 실행되는 환경으로 가정하지 않는다.
+- WSL의 Codex 진입점은 `bin/cmux-codex-windows`다. npm 내부 `codex.exe`를 직접 호출하면 설치 방식 정보가 빠져 업데이트 승인창이 생략될 수 있으므로 Windows `node.exe`로 공식 `codex.js`를 실행한다.
+- OS 분기·설치·업데이트 확인 절차는 `README.md`의 실행 환경 절을 따른다. macOS 실기기 검증과 Windows/WSL 검증 결과를 구분한다.
+
 ---
 
 

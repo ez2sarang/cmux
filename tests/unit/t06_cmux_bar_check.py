@@ -423,9 +423,17 @@ bar.draw_legacy(scr, [])
 check("레거시: 탭 줄·토글 글자 없음 (툴바만)", "▾" not in scr.line(0) and "▴" not in scr.line(0) and scr.line(0).startswith(" cmux │"), repr(scr.line(0)[:40]))
 
 # ── S: 토글 상태 파일 ──────────────────────────────────────────────────────
+scenario("D3", "새 레이아웃의 펼침 3줄")
+three_tabs = mk_tabs(["project-%02d" % i for i in range(25)], active=0)
+three_scr = FakeScr(3, 100)
+three_hits = []
+bar.draw_strip(three_scr, 3, three_tabs, False, three_hits)
+eq("3번째 줄은 아이콘 예약 없이 전체 폭 사용", [97, 89, 100], bar.strip_caps(100, 3))
+check("3번째 줄에도 탭을 그리고 클릭 영역을 제공", bool(three_scr.line(2).strip()) and any(h[0] == 2 and h[3][0] == "tab" for h in three_hits))
+
 scenario("S", "토글 상태 파일 읽기/쓰기")
 sf = os.path.join(TMP, "state", "tabbar-rows")
-eq("파일 없음 → 펼침", 2, bar.read_rows(sf))
+eq("파일 없음 → 펼침(2)", 2, bar.read_rows(sf))
 os.makedirs(os.path.dirname(sf))
 for content, want in (("1", 1), ("2", 2), ("2\n", 2), (" 2 \n", 2), ("", 1), ("abc", 1), ("3", 1), ("22", 1), ("0", 1)):
     with open(sf, "w") as f:
@@ -444,7 +452,7 @@ eq("toggle 1→2", 2, bar.toggle_rows(sf))
 eq("toggle 2→1", 1, bar.toggle_rows(sf))
 os.unlink(sf)
 nested = os.path.join(TMP, "new", "dir", "rows")
-eq("상위 디렉터리가 없어도 토글이 만든다", 1, bar.toggle_rows(nested))
+eq("상위 디렉터리가 없어도 토글이 만든다(기본 펼침 → 접힘)", 1, bar.toggle_rows(nested))
 eq("쓸 수 없는 경로: write_rows False·예외 없음", False, bar.write_rows("/dev/null/x/rows", 2))
 eq("쓸 수 없는 경로: toggle은 실제 상태(1)를 돌려준다", 1, bar.toggle_rows("/dev/null/x/rows"))
 os.environ["CMUX_TABBAR_STATE_FILE"] = "/x/y"
@@ -461,7 +469,7 @@ eq("cache_paths: 세션명 정리(/ → _)", ("/c/tabs-a_b.json", "/c/tabs-a_b.l
 eq("cache_paths: 세션명 없음", "/c/tabs-nosession.json", bar.cache_paths("/c", "")[0])
 # run_hit 토글 (zellij 호출 없음)
 sf2 = os.path.join(TMP, "state2", "rows")
-eq("run_hit(toggle) → 1", 1, bar.run_hit(("toggle", None), None, sf2))
+eq("run_hit(toggle) 기본 펼침 → 1", 1, bar.run_hit(("toggle", None), None, sf2))
 eq("run_hit(toggle) 한 번 더 → 2", 2, bar.run_hit(("toggle", None), None, sf2))
 
 # ── E: 리더 선출 · 탭 목록 공유 ────────────────────────────────────────────
@@ -1203,6 +1211,100 @@ raises_nothing("상태 읽기 예외 → 탭 목록은 그대로 갱신", lambda
 eq("상태 읽기 예외: 탭 3개 (state '')", ["", "", ""], [t["state"] for t in (LX.tabs or [])])
 bar.read_agent_states = orig_read
 os.environ.pop("CMUX_AGENT_STATE_DIR", None)
+
+scenario("ASYNC", "느린 목록 조회 중 입력 처리 · 조회 중복 방지 · 낡은 응답 차단")
+import threading
+
+same_stamp = bar.TabSource("same-stamp", os.path.join(TMP, "same-stamp-cache"), fetch=Fetcher(None))
+bar.write_atomic(same_stamp.cache_file, json.dumps(RAW_T))
+same_stamp._load_cache()
+original_stat = os.stat(same_stamp.cache_file)
+replacement = [dict(t, active=t["tab_id"] == 11) for t in RAW_T]
+bar.write_atomic(same_stamp.cache_file, json.dumps(replacement))
+os.utime(same_stamp.cache_file, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+check("시각과 크기가 같은 원자적 교체도 감지", same_stamp._load_cache())
+eq("같은 시각의 새 캐시에서 활성 탭 반영", [11], [t["id"] for t in same_stamp.tabs if t["active"]])
+
+
+class HeldFetch:
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+        self.fail = False
+
+    def __call__(self):
+        self.calls += 1
+        self.started.set()
+        if not self.release.wait(5):
+            raise TimeoutError("test fetch was not released")
+        if self.fail:
+            raise OSError("test fetch failure")
+        return [dict(t) for t in RAW_T]
+
+
+held = HeldFetch()
+async_source = bar.AsyncTabSource("async", os.path.join(TMP, "async-cache"), fetch=held)
+try:
+    async_source.poll(1.0)
+    eq("시작 2초 전에는 작업 스레드도 조회하지 않음", 0, held.calls)
+    started_at = time.monotonic()
+    async_source.poll(2.1)
+    check("조회가 끝나지 않아도 poll은 200ms 안에 반환", time.monotonic() - started_at < 0.2)
+    check("백그라운드 조회 시작", held.started.wait(1))
+    for _ in range(5):
+        async_source.poll(2.2)
+    eq("진행 중인 조회는 중복 실행하지 않음", 1, held.calls)
+    eq("조회 중에도 Picker 키를 즉시 처리할 수 있음", ("action", "picker"), bar.classify_key(ord("p")))
+    held.release.set()
+    async_source._pending[0].result(timeout=1)
+    check("결과 수신 후 목록 반영", async_source.poll(2.3))
+    eq("수신한 목록의 활성 탭", 10, next(t["id"] for t in async_source.tabs if t["active"]))
+
+    for through_follower in (False, True):
+        held.release.clear()
+        async_source.refresh_now()
+        held.release.set()
+        async_source._pending[0].result(timeout=1)
+        writer = (bar.TabSource("async", async_source.cache_dir, fetch=Fetcher(None))
+                  if through_follower else async_source)
+        writer.mark_active(11)
+        async_source.poll(2.4)
+        eq("늦은 조회가 %s의 클릭을 되돌리지 않음" % ("다른 바" if through_follower else "자기 바"),
+           [11], cache_active(async_source.cache_file))
+        # poll이 시작한 후속 조회를 마친 뒤 다음 시나리오 진행
+        if async_source._pending:
+            async_source._pending[0].result(timeout=1)
+            async_source.poll(2.5)
+
+    held.fail = True
+    async_source.refresh_now()
+    try:
+        async_source._pending[0].result(timeout=1)
+    except OSError:
+        pass
+    previous = list(async_source.tabs)
+    async_source.poll(2.6)
+    eq("조회 실패 시 마지막 정상 목록 유지", previous, async_source.tabs)
+    check("조회 실패 시 백오프 적용", async_source.next_fetch > time.time())
+    held.fail = False
+    async_source.refresh_now()
+    bar._touch(async_source.cache_file, time.time() + 1)
+    async_source._pending[0].result(timeout=1)
+    async_source.poll(2.7)
+    eq("백오프 중 하트비트가 있어도 성공한 조회 반영", 0, async_source.fail_streak)
+
+    with open(async_source.cache_file, "w") as broken:
+        broken.write("not json")
+    async_source._sig = None
+    async_source.refresh_now()
+    async_source._pending[0].result(timeout=1)
+    async_source.poll(2.8)
+    eq("손상된 캐시도 정상 조회 결과로 복구", [10], cache_active(async_source.cache_file))
+finally:
+    held.release.set()
+    async_source.close()
+eq("종료 시 리더 락 반납", False, os.path.exists(async_source.lock_dir))
 
 scenario("Z", "안전장치 — 이 시험 전체에서 실제 zellij 호출 0회")
 eq("실제 zellij 호출(가짜로 바꾸지 않은 경로) 0회", [], REAL_ZELLIJ)

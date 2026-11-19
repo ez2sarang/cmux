@@ -47,6 +47,8 @@ export FAKE_AGENT_LOG="$U_TMP/fake.log" FAKE_AGENT_SLEEP=0
 export CMUX_SOURCE_ONLY=1
 
 CMUX_SOURCE_ONLY=1 source "$CMUX_UNDER_TEST" || { print -u2 "source 실패: $CMUX_UNDER_TEST"; exit 1; }
+# A2는 기존 macOS/일반 Linux 탐색 규칙을 검증한다. WSL 분기는 t08_windows_codex에서 검증.
+_ag_is_wsl() { return 1; }
 
 # ── 공용 도우미 ───────────────────────────────────────
 # _set_mtime <파일> <epoch 초>

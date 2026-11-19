@@ -1,5 +1,8 @@
 # cmux 테스트
 
+- `t09_desktop_bridge`는 설치되는 Noctty/WSL 진입점의 설정·인자 전달·detach 셸과 지침 파일 생성·연결·손상 마커·심볼릭 링크 거부를 임시 HOME에서 검증합니다.
+- UI 성능 회귀: `t30_picker_unit`는 이동 중 경로 재조회가 없는지, `t06_cmux_bar`는 느린 비동기 조회·동시 조회 억제·파일 교체 감지·늦은 응답·오류 복구를 검증합니다. 실제 picker 입력은 `t31_picker_pty`로 확인합니다.
+- Windows Codex 분기: `zsh tests/unit/t08_windows_codex.zsh`는 macOS/일반 Linux 탐색 유지, WSL 기본 실행기, npm 내부 EXE 설정 보정, 사용자 오버라이드, 공백·따옴표·빈 인자 전달, 의존성 누락과 종료 코드 전파를 가짜 `node.exe`·`wslpath`로 검증합니다. 실제 npm 설치·업데이트·Codex 실행은 하지 않습니다. `t03_adapters`의 기존 탐색 시험은 비-WSL 분기로 고정합니다. Windows 실환경은 Noctty → WSL → cmux이며 macOS/Ghostty와 구분합니다.
 - 실행: `zsh tests/run.zsh [unit|integration|all]`(기본 all). 순서는 구문검사(`zsh -n`·`sh -n`·python ast, shellcheck 미설치) → 단위 → 통합이고, 하나라도 실패하면 비0으로 끝난다.
 - 통합 테스트는 실제 zellij 세션 `cmuxt<pid>`를 pty(`tests/lib/ptyrun.py`, 200x50, SIGTERM이면 창 닫기=HUP)에서 띄운다. 가짜 에이전트 `tests/bin/fake-agent`가 실행 인자와 cwd를 기록한다.
 - 대상 교체: `CMUX_UNDER_TEST=/경로/cmux`(기본은 레포 `bin/cmux`). 실패를 진단할 때 `T_KEEP=1`을 주면 임시 루트(`/private/tmp/cmuxt.*`)가 남는다.

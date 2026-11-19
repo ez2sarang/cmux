@@ -173,6 +173,25 @@ c.on_key(m.KEY_TAB, "/p/a")
 eq("등록 1개 → a·Tab 무시", ("claude", {}, "claude"), (c.base, c.explicit, c.effective("/p/a")))
 eq("next_agent: 목록에 없는 현재값 → 첫 항목", "claude", m.next_agent(["claude", "codex"], "gemini"))
 
+sc("PERF", "탐색 중 파일시스템 재조회 없음 · 기억 없음도 캐시 · Tab/a 동작 유지")
+from unittest.mock import patch
+with patch.object(m.os.path, "realpath", wraps=os.path.realpath) as resolve:
+    c = m.AgentChoice(["claude", "codex"], "claude", {})
+    c.badge("/p/no-prefs")
+    eq("기억 파일이 비었으면 realpath 호출 없음", 0, resolve.call_count)
+linked = os.path.join(tmp, "link", "proj")
+with patch.object(m.os.path, "realpath", wraps=os.path.realpath) as resolve:
+    c = m.AgentChoice(["claude", "codex"], "claude", {os.path.join(real, "proj"): "codex"})
+    for _ in range(5):
+        c.badge(linked)
+        c.badge("/p/no-memory")
+    eq("여러 번 그려도 물리 경로 조회는 항목당 1회", 2, resolve.call_count)
+    c.on_key(m.KEY_TAB, "/p/no-memory")
+    eq("기억 없음 캐시는 Tab으로 바뀐 기본값을 따른다", "codex", c.effective("/p/no-memory"))
+    c.on_key(ord("a"), linked)
+    eq("명시 변경은 캐시된 기억보다 우선", "claude", c.effective(linked))
+    eq("Tab/a/출력 확인에도 경로 재조회 없음", 2, resolve.call_count)
+
 # ── P5 ───────────────────────────────────────────────
 sc("P5", "새 env 없음 → 구버전과 같은 출력")
 c = m.AgentChoice.from_env({})

@@ -1,0 +1,35 @@
+#!/usr/bin/env zsh
+# Noctty → WSL → cmux → Windows npm Codex. Never call its internal codex.exe.
+# codex.js sets installation metadata and forwards the terminal and arguments.
+set -eu
+
+node_bin="$(command -v node.exe)" || {
+  print -u2 'cmux: Windows node.exe not found in WSL PATH. Install Node.js on Windows and enable WSL Windows PATH integration.'
+  exit 127
+}
+command -v wslpath >/dev/null 2>&1 || {
+  print -u2 'cmux: cmux-codex-windows requires WSL (wslpath is missing).'
+  exit 127
+}
+
+codex_js=""
+if [[ "${CMUX_CODEX_BIN:-}" == */node_modules/@openai/codex/*/codex.exe ]]; then
+  # Preserve the selected npm installation, including a custom global prefix.
+  codex_js="${CMUX_CODEX_BIN%%/node_modules/@openai/codex/*}/node_modules/@openai/codex/bin/codex.js"
+else
+  # Windows npm puts codex.cmd next to node_modules; do not select a Linux npm package.
+  for npm_dir in "${path[@]}"; do
+    if [[ -f "$npm_dir/codex.cmd" && -f "$npm_dir/node_modules/@openai/codex/bin/codex.js" ]]; then
+      codex_js="$npm_dir/node_modules/@openai/codex/bin/codex.js"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$codex_js" || ! -f "$codex_js" ]]; then
+  print -u2 'cmux: Windows npm Codex launcher not found. Install @openai/codex with npm on Windows and add its global prefix to WSL PATH.'
+  exit 127
+fi
+
+codex_js_windows="$(wslpath -w "${codex_js:A}")"
+exec "$node_bin" "$codex_js_windows" "$@"

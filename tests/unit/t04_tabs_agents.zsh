@@ -41,6 +41,9 @@ CMUX_SOURCE_ONLY=1 source "$CMUX_UNDER_TEST" || { print -u2 "source 실패: $CMU
 DEV_ROOT="$U_TMP/dev"
 EXTRAS_FILE="$U_TMP/cfg/extras"
 
+_inode() { python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "$1"; }
+_checksum() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"; }
+
 T=$'\t'
 A="$DEV_ROOT/alpha" B="$DEV_ROOT/beta" G="$DEV_ROOT/gamma" MP="$DEV_ROOT/my·proj"
 X="$U_TMP/x/proj" Y="$U_TMP/y/proj"
@@ -207,20 +210,20 @@ out="$(CMUX_CONFIG_FILE="$CFG2" _cm default codex; print -r -- "rc=$?")"
 t_assert_contains "파일·디렉토리 없음 → 생성, 확인 메시지" "$out" "기본 에이전트 = codex  (설정: $CFG2)"
 t_assert_eq "새 설정 파일 내용" "CMUX_DEFAULT_AGENT=codex" "$(cat "$CFG2" 2>/dev/null)"
 print -r -l -- "# cmux 설정" "CMUX_CODEX_PERM=auto" "  export CMUX_DEFAULT_AGENT=claude" "FOO=1" "CMUX_DEFAULT_AGENT=opencode" "# CMUX_DEFAULT_AGENT=x" > "$CMUX_CONFIG_FILE"
-ino0="$(stat -f %i "$CMUX_CONFIG_FILE")"
+ino0="$(_inode "$CMUX_CONFIG_FILE")"
 _cm default opencode >/dev/null
 t_assert_eq "기존 줄 교체(첫 위치), 중복 줄 제거, 다른 줄·주석 보존" \
   "$(_lines "# cmux 설정" "CMUX_CODEX_PERM=auto" "CMUX_DEFAULT_AGENT=opencode" "FOO=1" "# CMUX_DEFAULT_AGENT=x")" "$(cat "$CMUX_CONFIG_FILE")"
 t_assert_true "원자적 교체 (tmp → mv: inode 바뀜, tmp 잔여 없음)" \
-  '[[ "$(stat -f %i "$CMUX_CONFIG_FILE")" != "$ino0" && -z "$(print -l -- "$CMUX_CONFIG_FILE".tmp.*(N))" ]]'
+  '[[ "$(_inode "$CMUX_CONFIG_FILE")" != "$ino0" && -z "$(print -l -- "$CMUX_CONFIG_FILE".tmp.*(N))" ]]'
 print -r -l -- "FOO=1" > "$CMUX_CONFIG_FILE"
 _cm default codex >/dev/null
 t_assert_eq "줄이 없으면 끝에 추가" "$(_lines "FOO=1" "CMUX_DEFAULT_AGENT=codex")" "$(cat "$CMUX_CONFIG_FILE")"
-sum0="$(md5 -q "$CMUX_CONFIG_FILE")"
+sum0="$(_checksum "$CMUX_CONFIG_FILE")"
 out="$(_cm default nope; print -r -- "rc=$?")"
 t_assert_contains "미등록 에이전트 → 오류 + 사용 가능 목록" "$out" "알 수 없는 에이전트: 'nope' (사용 가능: claude codex opencode kimi)"
 t_assert_contains "미등록 에이전트 → exit 1" "$out" "rc=1"
-t_assert_eq "미등록 에이전트 → 파일 그대로" "$sum0" "$(md5 -q "$CMUX_CONFIG_FILE")"
+t_assert_eq "미등록 에이전트 → 파일 그대로" "$sum0" "$(_checksum "$CMUX_CONFIG_FILE")"
 out="$(CMUX_AGENT=claude _cm default opencode)"
 t_assert_contains "env CMUX_AGENT가 다르면 우선 안내" "$out" "지금은 환경변수 CMUX_AGENT=claude 가 우선합니다"
 mkdir -p "$U_TMP/real"; print -r -- "BAR=2" > "$U_TMP/real/config"; ln -s "$U_TMP/real/config" "$U_TMP/cfg/linked"
@@ -300,10 +303,10 @@ t_assert_eq "claude → 설치된 claude-tab, 파일 생성 없음" "claude-tab|
 _tab_layout codex; rc=$?
 t_assert_eq "codex → cmux-tab-codex (rc 0)" "cmux-tab-codex|0" "$REPLY|$rc"
 t_assert_eq "생성 파일 내용 = 생성기 출력" "$(_kdl_tab_layout codex)" "$(cat "$U_TMP/layouts/cmux-tab-codex.kdl" 2>/dev/null)"
-ino0="$(stat -f %i "$U_TMP/layouts/cmux-tab-codex.kdl")"
+ino0="$(_inode "$U_TMP/layouts/cmux-tab-codex.kdl")"
 _tab_layout codex
 t_assert_true "매번 원자적 덮어쓰기 (inode 바뀜, tmp 잔여 없음)" \
-  '[[ "$(stat -f %i "$U_TMP/layouts/cmux-tab-codex.kdl")" != "$ino0" && -z "$(print -l -- "$U_TMP"/layouts/*.tmp.*(N))" ]]'
+  '[[ "$(_inode "$U_TMP/layouts/cmux-tab-codex.kdl")" != "$ino0" && -z "$(print -l -- "$U_TMP"/layouts/*.tmp.*(N))" ]]'
 mkdir -p "$U_TMP/rolayouts"; chmod 555 "$U_TMP/rolayouts"
 out="$(ZELLIJ_LAYOUTS_DIR="$U_TMP/rolayouts" _tab_layout opencode 2>&1; print -r -- "rc=$?")"
 t_assert_contains "쓸 수 없는 레이아웃 디렉토리 → 경고·비0" "$out" "탭 레이아웃을 만들지 못했습니다: $U_TMP/rolayouts/cmux-tab-opencode.kdl"$'\n'"rc=1"

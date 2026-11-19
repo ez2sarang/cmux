@@ -20,6 +20,7 @@ zmodload -F zsh/stat b:zstat     # zstat만 — 외부 stat 명령은 가리지 
 
 # 등록된 에이전트 — 기본 에이전트는 claude
 CMUX_AGENTS=(claude codex opencode kimi)
+typeset -g _CMUX_AGENTS_DIR="${${(%):-%x}:A:h}"
 
 _agent_known() {
   [[ -n "$1" ]] && (( ${CMUX_AGENTS[(Ie)$1]} ))
@@ -186,8 +187,21 @@ _ag_claude_fastfail()    { REPLY=5 }
 # ── codex ─────────────────────────────────────────────
 _ag_codex_label() { REPLY="Codex" }
 
-# 바이너리 탐색: CMUX_CODEX_BIN → brew → /usr/local → nvm(가장 최근 mtime 하나) → bun → PATH
+_ag_is_wsl() {
+  [[ "$OSTYPE" == linux* && -r /proc/sys/kernel/osrelease &&
+     "${(L)$(</proc/sys/kernel/osrelease)}" == *microsoft* ]]
+}
+
+# Windows/Noctty → WSL: Windows npm 진입점을 사용해 업데이트 설치 정보 유지.
+# macOS/Ghostty 및 일반 Linux: 기존 brew/nvm/bun/PATH 탐색 유지.
+# 사용자 지정 실행 파일은 우선하되, npm 내부 codex.exe 직결만 정상 진입점으로 보정.
 _ag_codex_bin() {
+  if _ag_is_wsl && [[ -z "${CMUX_CODEX_BIN:-}" ||
+       "${CMUX_CODEX_BIN:-}" == */node_modules/@openai/codex/*/codex.exe ]]; then
+    REPLY="${_CMUX_AGENTS_DIR}/cmux-codex-windows"
+    [[ -f "$REPLY" && -x "$REPLY" ]]
+    return $?
+  fi
   local -a nvm=("$HOME"/.nvm/versions/node/*/bin/codex(N-*om[1]))
   _ag_search_bin codex /opt/homebrew/bin/codex /usr/local/bin/codex "${nvm[@]}" "$HOME/.bun/bin/codex"
 }
