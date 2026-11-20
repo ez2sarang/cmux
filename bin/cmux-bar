@@ -39,6 +39,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 
@@ -976,22 +977,82 @@ def zellij_action(*args):
     )
 
 
+def record_after_close(lines, panes, target, directory, cmux):
+    """Forget the clicked project/agent, preserving the original order of other records."""
+    if all(p["tab_id"] == target["tab_id"] for p in panes):
+        return []
+
+    def spec(line):
+        path, sep, agent = line.rpartition("\t")
+        return (path, agent) if sep else (line, "claude")
+
+    records = [spec(line) for line in lines]
+    commands = {p.get("terminal_command") for p in panes if p["tab_id"] == target["tab_id"]}
+    basename = os.path.basename(directory)
+    has_launcher = any(cmd and (cmd == cmux + " launch" or cmd.startswith(cmux + " launch --agent ")) for cmd in commands)
+    for path, agent in records:
+        if os.path.realpath(path) != directory:
+            continue
+        label = basename if agent == "claude" else basename + "·" + agent
+        command = cmux + (" launch" if agent == "claude" else " launch --agent " + agent)
+        if command not in commands and (has_launcher or label != target["tab_name"]):
+            continue
+        # One record can represent multiple open copies. Distinguish the usual
+        # same-basename case (separate recorded paths) from repeated opens.
+        same_label = {p["tab_id"] for p in panes if p["tab_name"] == target["tab_name"]}
+        paths = {d for d, a in records if a == agent and os.path.basename(d) == basename}
+        if len(same_label) > len(paths):
+            return lines
+        return [line for line, pair in zip(lines, records) if pair != (path, agent)]
+    return lines
+
+
+def close_and_record(record, cmux):
+    # The caller holds the session-tabs lock and is detached from the tab's tty.
+    panes = _zellij_json(["list-panes", "--json"], LIST_TABS_TIMEOUT)
+    target = _my_pane(panes, MY_PANE_ID)
+    if target is None or not isinstance(target.get("tab_id"), int):
+        return 1
+    staged = None
+    try:
+        if record and os.path.isfile(record):
+            with open(record, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            kept = record_after_close(lines, panes, target, os.path.realpath(os.getcwd()), cmux)
+            if kept != lines:
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(record) or ".",
+                                                 prefix=".cmux-close-", delete=False) as f:
+                    staged = f.name
+                    f.writelines(line + "\n" for line in kept)
+        rc = subprocess.run(["zellij", "-s", SESSION, "action", "close-tab", "--tab-id", str(target["tab_id"])]).returncode
+        if rc == 0 and staged is not None:
+            os.replace(staged, record)
+            staged = None
+        return rc
+    finally:
+        if staged is not None:
+            os.unlink(staged)
+
+
 def do_action(action: str) -> None:
+    cmux = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cmux")
     cmds = {
         "picker": [
             "zellij", "action", "new-pane",
             "-f", "-c", "-n", "cmux-picker",
             "--", "/bin/zsh", "-ic", "cmux",
         ],
-        "close": ["zellij", "action", "close-tab"],
+        "close": [cmux, "_bar-close"],
         "quit":  ["zellij", "action", "quit"],
     }
     cmd = cmds.get(action)
     if cmd:
         subprocess.Popen(
             cmd,
+            stdin=subprocess.DEVNULL if action == "close" else None,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=action == "close",
         )
 
 
@@ -1275,4 +1336,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--close-and-record":
+        sys.exit(close_and_record(sys.argv[2], sys.argv[3]))
     main()

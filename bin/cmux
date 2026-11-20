@@ -256,9 +256,19 @@ _tabs_backup() {
   return 0
 }
 
+# Close runs outside its pane. Serialize it with other record writers (including
+# a second click), using a separate inode so replacing session-tabs is atomic.
+_tabs_locked() {
+  local fd
+  mkdir -p -- "${TABS_FILE:h}" && : >> "${TABS_FILE}.lock" || return 1
+  zmodload zsh/system && zsystem flock -f fd "${TABS_FILE}.lock" || return 1
+  { "$@" } always { zsystem flock -u "$fd" }
+}
+
+_tabs_save() { _tabs_locked _tabs_save_unlocked "$@" }
+
 # 기록 전체 덮어쓰기 (spec 인자들, 순서 유지 — 같은 spec은 처음 것만)
-_tabs_save() {
-  mkdir -p "$(dirname "$TABS_FILE")"
+_tabs_save_unlocked() {
   local s
   local -aU lines
   for s in "$@"; do
@@ -267,14 +277,18 @@ _tabs_save() {
     lines+=("$REPLY")
   done
   _tabs_backup "${lines[@]}"
-  : > "$TABS_FILE"
-  (( ${#lines} )) && print -rl -- "${lines[@]}" >> "$TABS_FILE"
-  return 0
+  local tmp
+  tmp=$(mktemp "${TABS_FILE}.XXXXXX") || return 1
+  {
+    if (( ${#lines} )); then print -rl -- "${lines[@]}" > "$tmp" || return 1; fi
+    mv -f -- "$tmp" "$TABS_FILE"
+  } always { rm -f -- "$tmp" }
 }
 
 # 없는 spec만 뒤에 추가 (순서 유지, 중복 제거 — 같은 경로라도 에이전트가 다르면 별개)
-_tabs_append() {
-  mkdir -p "$(dirname "$TABS_FILE")"
+_tabs_append() { _tabs_locked _tabs_append_unlocked "$@" }
+
+_tabs_append_unlocked() {
   touch "$TABS_FILE"
   local s
   for s in "$@"; do
@@ -289,9 +303,10 @@ _tabs_append() {
 }
 
 # 살아 있는 세션의 실제 탭 순서로 기록 정리 (kill/restart 직전에 호출)
-_tabs_sync_live() {
-  _session_alive || return 0
+_tabs_sync_live() { _tabs_locked _tabs_sync_live_unlocked }
 
+_tabs_sync_live_unlocked() {
+  _session_alive || return 0
   local names
   if [[ -n "$ZELLIJ" ]]; then
     names=$(zellij action query-tab-names 2>/dev/null)
@@ -352,7 +367,7 @@ _tabs_sync_live() {
     _warn "경로를 알 수 없는 탭 ${unmapped}개 — 기존 기록과 병합해 보존합니다" >&2
   fi
 
-  [[ ${#specs[@]} -gt 0 ]] && _tabs_save "${specs[@]}"
+  [[ ${#specs[@]} -gt 0 ]] && _tabs_save_unlocked "${specs[@]}"
   return 0
 }
 
@@ -603,7 +618,7 @@ _open_one() {
     local -a specs=()
     if [[ -z "$CMUX_FRESH" ]]; then
       _tabs_line "$spec"   # _tabs_load와 같은 정규형으로 비교
-      specs=("${(@f)$(_tabs_load)}")
+      specs=("${(@f)$(_tabs_locked _tabs_load)}")
       specs=("${(@)specs:#}")
       specs=("${(@)specs:#$REPLY}")
     fi
@@ -666,7 +681,7 @@ _open_many() {
 # 기록된 탭 복원 (있으면 0, 없으면 1)
 _restore_tabs() {
   local -a restore
-  restore=("${(@f)$(_tabs_load)}")
+  restore=("${(@f)$(_tabs_locked _tabs_load)}")
   restore=("${(@)restore:#}")  # 빈 요소 제거
 
   [[ ${#restore[@]} -eq 0 ]] && return 1
@@ -1280,6 +1295,15 @@ _launch_agent() {
 
 # ── 서브커맨드 ────────────────────────────────────────
 case "$1" in
+  _bar-close)
+    # Only the bar in this cmux session owns this restore file.
+    [[ -n "$ZELLIJ_SESSION_NAME" ]] || exit 1
+    if [[ "$ZELLIJ_SESSION_NAME" != "$SESSION_NAME" ]]; then
+      exec "${CMUX_SELF:h}/cmux-bar" --close-and-record "" "$CMUX_SELF"
+    fi
+    _tabs_locked "${CMUX_SELF:h}/cmux-bar" --close-and-record "$TABS_FILE" "$CMUX_SELF"
+    exit $?
+    ;;
   -h|--help)
     echo "사용법: cmux [서브커맨드] [인수]"
     echo ""
