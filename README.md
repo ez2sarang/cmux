@@ -69,8 +69,10 @@ Windows의 cmux와 zellij는 WSL 안에서 실행하고, Codex는 Windows npm �
 Windows에서 Node.js와 Codex를 설치한 뒤, WSL에는 zsh·zellij·Python 3를 준비하고 아래 설치 절차를 **WSL 안에서** 실행합니다. Noctty 시작 명령은 이 환경에서 사용하는 다음 형태입니다(배포판·프로젝트 경로는 환경에 맞게 지정):
 
 ```text
-noctty.exe -e wsl.exe -d Ubuntu --cd /mnt/c/dev/ai -- /home/<WSL사용자>/.local/bin/cmux-desktop
+noctty.exe --copy-on-select=clipboard -e wsl.exe -d Ubuntu --cd /mnt/c/dev/ai -- /home/<WSL사용자>/.local/bin/cmux-desktop
 ```
+
+Windows Codex 0.170.0에서 본문이나 입력창의 단어를 더블클릭하거나 드래그해 자동 복사하려면 Windows 사용자 설정 파일 `%USERPROFILE%\.codex\config.toml`의 `[tui]`에 `copy_on_select = "always"`를 설정합니다. 이미 열린 Codex 탭에는 작업이 끝난 뒤 `/config` → `Text selection` → `Copy on select` → `On`으로 바로 적용할 수 있습니다. 위 실행 명령의 `--copy-on-select=clipboard`는 Noctty 자체에서 선택한 텍스트에 적용됩니다.
 
 `cmux-desktop`도 설치 스크립트가 설치합니다. `~/.local/bin`을 PATH에 추가하고 cmux 설정의 `CMUX_ROOT`로 이동한 뒤 `cmux`를 실행합니다. detach 뒤에는 같은 터미널에 zsh 셸이 남습니다. WSL의 `~/.config/cmux/config` 예:
 
